@@ -138,7 +138,7 @@ def main():
     parser = argparse.ArgumentParser(description="Batch Process Images with YOLO and Florence-2")
     parser.add_argument("-i", "--input_dir", type=str, required=True, help="Path to input directory containing images")
     parser.add_argument("-o", "--output_dir", type=str, required=True, help="Path to output directory to save JSONs")
-    parser.add_argument("--yolo_model", type=str, default="yolov8s-world.pt", help="Path to YOLO model")
+    parser.add_argument("--yolo_model", type=str, default="yolov8x-world.pt", help="Path to YOLO model")
     parser.add_argument("--florence_model", type=str, default="microsoft/Florence-2-large-ft", help="Florence model ID")
     parser.add_argument("--iou", type=float, default=0.75, help="IoU threshold for removing duplicates")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of images to process (default: all)")
@@ -187,7 +187,7 @@ def main():
         "total_images": len(all_results),
         "results": all_results,
     }
-    combined_file = output_folder / f"{video_id}_object_dection.json"
+    combined_file = output_folder / f"{video_id}_object_detection.json"
     with open(combined_file, 'w', encoding='utf-8') as f:
         json.dump(combined_payload, f, indent=2, ensure_ascii=False)
 
