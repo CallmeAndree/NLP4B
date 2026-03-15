@@ -93,14 +93,16 @@ def search_and_display(query: str, top_k: int = TOP_K, threshold: float = SCORE_
     # Encode query
     query_vec = encode_text(query)
 
-    # Search
-    hits = client.search(
+    # Search (qdrant-client >= 1.12 uses query_points instead of search)
+    response = client.query_points(
         collection_name=COLLECTION,
-        query_vector=NamedVector(name=DENSE_NAME, vector=query_vec),
+        query=query_vec,
+        using=DENSE_NAME,
         limit=top_k,
         with_payload=True,
         score_threshold=threshold,
     )
+    hits = response.points
 
     if not hits:
         print("❌ No results found. Try lowering SCORE_THRESHOLD or a different query.")
