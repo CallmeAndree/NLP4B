@@ -243,13 +243,33 @@ def build_points_for_video(
 
     for idx in range(n_frames):
         # ── Frame identifier ─────────────────────────────────────────────
-        if frame_names and idx < len(frame_names):
-            frame_filename = frame_names[idx]
-        else:
-            frame_filename = f"{video_id}_{idx:05d}.jpg"
+        # _frames.json may contain:
+        #   A) raw ints like [872, 1230, ...]        → original video frame index
+        #   B) strings  like ["video_00872.jpg", ...] → full filename
+        #   C) not exist at all                       → fallback to sequential idx
+        raw_entry = frame_names[idx] if (frame_names and idx < len(frame_names)) else None
 
-        # Derive a clean frame_idx integer
-        frame_idx = idx
+        if raw_entry is not None:
+            if isinstance(raw_entry, (int, float)):
+                # Case A: raw frame index number → build filename
+                frame_idx = int(raw_entry)
+                frame_filename = f"{video_id}_{frame_idx:05d}.jpg"
+            elif isinstance(raw_entry, str) and raw_entry.replace(".", "").replace("_", "").isalnum():
+                # Case B: full filename string
+                frame_filename = raw_entry
+                # Try to extract frame index from filename like "video_00872.jpg"
+                try:
+                    stem = Path(raw_entry).stem  # "video_00872"
+                    frame_idx = int(stem.rsplit("_", 1)[-1])
+                except (ValueError, IndexError):
+                    frame_idx = idx
+            else:
+                frame_filename = str(raw_entry)
+                frame_idx = idx
+        else:
+            # Case C: no _frames.json → sequential index (likely wrong for Azure)
+            frame_idx = idx
+            frame_filename = f"{video_id}_{frame_idx:05d}.jpg"
 
         # ── Deterministic ID ─────────────────────────────────────────────
         point_id = deterministic_id(video_id, frame_idx)
