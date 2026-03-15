@@ -199,7 +199,7 @@ def interactive_loop():
 
     while True:
         try:
-            query = input("🔍 Query: ").strip()
+            query = str(input("🔍 Query: ")).strip()
         except (EOFError, KeyboardInterrupt):
             print("\n👋 Exiting.")
             break
