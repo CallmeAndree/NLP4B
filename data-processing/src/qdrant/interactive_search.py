@@ -78,8 +78,15 @@ def encode_text(query: str) -> list[float]:
     with torch.no_grad():
         text_features = model.get_text_features(**inputs)
 
-    # Same processing as embedding.py: [0].cpu().numpy().flatten().astype("float32")
-    embedding = text_features[0].cpu().numpy().flatten().astype("float32")
+    # SigLIP may return (batch, seq_len, dim) or (batch, dim)
+    # Must produce exactly (1152,) to match image embeddings
+    if text_features.ndim == 3:
+        # (1, seq_len, 1152) → mean pool over tokens → (1, 1152)
+        embedding = text_features[0].mean(dim=0).cpu().numpy().astype("float32")
+    else:
+        # (1, 1152) → take first item
+        embedding = text_features[0].cpu().numpy().flatten().astype("float32")
+
     return embedding.tolist()
 
 
