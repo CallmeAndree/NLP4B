@@ -76,16 +76,28 @@ def encode_text(query: str) -> list[float]:
     ).to(DEVICE)
 
     with torch.no_grad():
-        text_features = model.get_text_features(**inputs)
+        outputs = model.get_text_features(**inputs)
 
-    # SigLIP may return (batch, seq_len, dim) or (batch, dim)
-    # Must produce exactly (1152,) to match image embeddings
-    if text_features.ndim == 3:
-        # (1, seq_len, 1152) → mean pool over tokens → (1, 1152)
-        embedding = text_features[0].mean(dim=0).cpu().numpy().astype("float32")
+    # Extract the actual tensor (mirrors embedding.py logic for images)
+    if isinstance(outputs, torch.Tensor):
+        features = outputs
+    elif hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+        features = outputs.pooler_output
+    elif hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
+        features = outputs.text_embeds
+    elif hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+        features = outputs.last_hidden_state.mean(dim=1)  # mean pool tokens
     else:
-        # (1, 1152) → take first item
-        embedding = text_features[0].cpu().numpy().flatten().astype("float32")
+        # Tuple fallback
+        features = outputs[0]
+        if features.ndim == 3:
+            features = features.mean(dim=1)
+
+    embedding = features[0].cpu().numpy().flatten().astype("float32")
+
+    # Sanity check: must be 1152d
+    if len(embedding) != 1152:
+        raise ValueError(f"Text embedding dim={len(embedding)}, expected 1152")
 
     return embedding.tolist()
 
