@@ -370,7 +370,7 @@ def main() -> None:
         logger.error(f"Embeddings directory not found: {args.embeddings_dir}")
         sys.exit(1)
 
-    npy_files = sorted(args.embeddings_dir.glob("*.npy"))
+    npy_files = sorted(args.embeddings_dir.rglob("*.npy"))
     if not npy_files:
         logger.error(f"No .npy files found in {args.embeddings_dir}")
         sys.exit(1)
