@@ -196,9 +196,11 @@ def get_bm25() -> SparseTextEmbedding:
 def get_bge_m3():
     global _bge
     if _bge is None:
-        logger.info(f"Loading BGE-M3: {BGE_M3_MODEL} ...")
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Loading BGE-M3: {BGE_M3_MODEL} on [{device}] ...")
         from sentence_transformers import SentenceTransformer
-        _bge = SentenceTransformer(BGE_M3_MODEL)
+        _bge = SentenceTransformer(BGE_M3_MODEL, device=device)
         logger.info("BGE-M3 loaded.")
     return _bge
 
@@ -264,11 +266,35 @@ def load_ocr_data(video_id: str, frame_idx: int) -> str | None:
 
 
 # ── 10. Collection setup ─────────────────────────────────────────────────────
+REQUIRED_DENSE = {VEC_DENSE, VEC_CAPTION_DENSE}
+REQUIRED_SPARSE = {VEC_OBJECT_SPARSE, VEC_OCR_SPARSE}
+
+
 def ensure_collection(client: QdrantClient, name: str) -> None:
-    if name in [c.name for c in client.get_collections().collections]:
-        logger.info(f"Collection '{name}' exists.")
-        return
-    logger.info(f"Creating collection '{name}' ...")
+    existing = [c.name for c in client.get_collections().collections]
+
+    if name in existing:
+        # Validate that all 4 required vector names exist in current schema
+        info = client.get_collection(name)
+        existing_vecs = set(info.config.params.vectors.keys()) if info.config.params.vectors else set()
+        existing_sparse = set(info.config.params.sparse_vectors.keys()) if info.config.params.sparse_vectors else set()
+
+        missing_dense = REQUIRED_DENSE - existing_vecs
+        missing_sparse = REQUIRED_SPARSE - existing_sparse
+
+        if not missing_dense and not missing_sparse:
+            logger.info(f"Collection '{name}' exists with correct 4-vector schema.")
+            return
+
+        # Schema mismatch → delete and recreate
+        logger.warning(
+            f"Collection '{name}' has stale schema. "
+            f"Missing dense: {missing_dense or 'none'}, sparse: {missing_sparse or 'none'}. "
+            f"Deleting and recreating..."
+        )
+        client.delete_collection(name)
+
+    logger.info(f"Creating collection '{name}' with 4-vector schema ...")
     client.create_collection(
         collection_name=name,
         vectors_config={
