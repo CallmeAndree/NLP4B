@@ -49,9 +49,9 @@ except ImportError:
     _pip("fastembed")
 
 try:
-    from FlagEmbedding import BGEM3FlagModel
+    from sentence_transformers import SentenceTransformer
 except ImportError:
-    _pip("FlagEmbedding")
+    _pip("sentence-transformers")
 
 # ── 1. Imports ────────────────────────────────────────────────────────────────
 import argparse
@@ -196,9 +196,9 @@ def get_bm25() -> SparseTextEmbedding:
 def get_bge_m3():
     global _bge
     if _bge is None:
-        logger.info(f"Loading BGE-M3: {BGE_M3_MODEL} (fp16) ...")
-        from FlagEmbedding import BGEM3FlagModel
-        _bge = BGEM3FlagModel(BGE_M3_MODEL, use_fp16=True)
+        logger.info(f"Loading BGE-M3: {BGE_M3_MODEL} ...")
+        from sentence_transformers import SentenceTransformer
+        _bge = SentenceTransformer(BGE_M3_MODEL)
         logger.info("BGE-M3 loaded.")
     return _bge
 
@@ -222,8 +222,7 @@ def encode_bge_m3(text: str) -> list[float] | None:
     if not text or not text.strip():
         return None
     try:
-        result = get_bge_m3().encode([text])
-        vec = result["dense_vecs"][0]
+        vec = get_bge_m3().encode(text, normalize_embeddings=True)
         if hasattr(vec, "tolist"):
             vec = vec.tolist()
         if len(vec) != BGE_M3_DIM:
