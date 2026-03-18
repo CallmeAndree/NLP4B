@@ -169,8 +169,13 @@ def discover_detection_jsons(container: ContainerClient) -> dict[str, str]:
     """Find detection JSON blob paths by scanning detections container."""
     det_map = {}
     for blob in container.list_blobs():
-        if blob.name.endswith(".json"):
-            vid = Path(blob.name).stem
+        if blob.name.endswith(".json") or blob.name.endswith(".js"):
+            stem = Path(blob.name).stem
+            # e.g. '0DVVomZLJQs_object_detection' -> '0DVVomZLJQs'
+            if stem.endswith("_object_detection"):
+                vid = stem.replace("_object_detection", "")
+            else:
+                vid = stem
             det_map[vid] = blob.name
     return det_map
 
