@@ -9,10 +9,11 @@ Usage (Colab):
     import os
     os.environ["AZURE_STORAGE_CONNECTION_STRING"] = "<your-connection-string>"
 
-    # 2. Run the migration
+    # 2. Run the migration (only pass the directories you want to upload)
     !python azure_migrator.py \
         --frames_dir  "/content/drive/MyDrive/output" \
         --embeddings_dir "/content/drive/MyDrive/embeddings" \
+        --ocr_dir "/content/drive/MyDrive/ocr" \
         --workers 10
 """
 
@@ -78,27 +79,27 @@ class UploadTask(NamedTuple):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Upload keyframe images and embedding files from local/Google-Drive "
+            "Upload keyframe images, embeddings, and OCR files from local/Google-Drive "
             "directories to Azure Blob Storage."
         ),
     )
     parser.add_argument(
         "--frames_dir",
         type=Path,
-        required=True,
-        help=(
-            "Root directory containing keyframe images. "
-            "Expected structure: <frames_dir>/<video_id>/*.jpg"
-        ),
+        default=None,
+        help="Root directory containing keyframe images.",
     )
     parser.add_argument(
         "--embeddings_dir",
         type=Path,
-        required=True,
-        help=(
-            "Root directory containing embedding files (.npy, _frames.json). "
-            "Expected structure: <embeddings_dir>/<video_id>.npy"
-        ),
+        default=None,
+        help="Root directory containing embedding files (.npy, _frames.json).",
+    )
+    parser.add_argument(
+        "--ocr_dir",
+        type=Path,
+        default=None,
+        help="Root directory containing OCR files (.json, .txt).",
     )
     parser.add_argument(
         "--workers",
@@ -182,6 +183,35 @@ def discover_embeddings(embeddings_dir: Path) -> list[UploadTask]:
     return tasks
 
 
+def discover_ocr(ocr_dir: Path) -> list[UploadTask]:
+    """
+    Scan <ocr_dir> for OCR files.
+    Routed to Azure container "ocr" at path: {video_id}/{filename}
+    """
+    tasks: list[UploadTask] = []
+    if not ocr_dir or not ocr_dir.is_dir():
+        logger.warning(f"OCR directory not found or not provided, skipping: {ocr_dir}")
+        return tasks
+
+    valid_suffixes = {".npy", ".json", ".txt", ".csv"}
+    for fpath in sorted(ocr_dir.iterdir()):
+        if not fpath.is_file() or fpath.suffix.lower() not in valid_suffixes:
+            continue
+
+        stem = fpath.stem
+        # Try to infer video_id from filename (e.g. video_id_ocr.json -> video_id)
+        if stem.endswith("_ocr"):
+            video_id = stem[: -len("_ocr")]
+        else:
+            video_id = stem
+
+        blob_path = f"{video_id}/{fpath.name}"
+        tasks.append(UploadTask(local_path=fpath, container="ocr", blob_path=blob_path))
+
+    logger.info(f"Discovered {len(tasks)} OCR file(s) in {ocr_dir}")
+    return tasks
+
+
 # ── 6. Upload logic ──────────────────────────────────────────────────────────
 def blob_exists(blob_client) -> bool:
     """Return True if the blob already exists on Azure."""
@@ -258,7 +288,12 @@ def main() -> None:
     blob_service_client = BlobServiceClient.from_connection_string(conn_str)
 
     # ── Ensure containers exist ──────────────────────────────────────────
-    for container_name in ("keyframes", "embeddings"):
+    containers_to_create = []
+    if args.frames_dir: containers_to_create.append("keyframes")
+    if args.embeddings_dir: containers_to_create.append("embeddings")
+    if args.ocr_dir: containers_to_create.append("ocr")
+
+    for container_name in containers_to_create:
         try:
             blob_service_client.create_container(container_name)
             logger.info(f"Created container: {container_name}")
@@ -272,17 +307,22 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("Azure Blob Storage Migration")
     logger.info("=" * 60)
-    logger.info(f"Frames dir:     {args.frames_dir}")
-    logger.info(f"Embeddings dir: {args.embeddings_dir}")
+    if args.frames_dir: logger.info(f"Frames dir:     {args.frames_dir}")
+    if args.embeddings_dir: logger.info(f"Embeddings dir: {args.embeddings_dir}")
+    if args.ocr_dir: logger.info(f"OCR dir:        {args.ocr_dir}")
     logger.info(f"Workers:        {args.workers}")
     logger.info("")
 
     tasks: list[UploadTask] = []
-    tasks.extend(discover_keyframes(args.frames_dir))
-    tasks.extend(discover_embeddings(args.embeddings_dir))
+    if args.frames_dir:
+        tasks.extend(discover_keyframes(args.frames_dir))
+    if args.embeddings_dir:
+        tasks.extend(discover_embeddings(args.embeddings_dir))
+    if args.ocr_dir:
+        tasks.extend(discover_ocr(args.ocr_dir))
 
     if not tasks:
-        logger.warning("No files discovered. Nothing to upload.")
+        logger.warning("No files discovered (or directories omitted). Nothing to upload.")
         return
 
     # ── Upload with ThreadPoolExecutor ───────────────────────────────────
