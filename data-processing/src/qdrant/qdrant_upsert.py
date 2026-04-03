@@ -82,6 +82,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
     PointStruct,
+    PointVectors,
     SparseIndexParams,
     SparseVector,
     SparseVectorParams,
@@ -124,10 +125,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="4-Vector Qdrant Upsert — Azure Streaming (RAM-optimized) with OCR & Metadata"
     )
-    p.add_argument("--mode", choices=["upsert", "update_payload"], default="upsert",
-                   help="'upsert' = Create points w/ vectors. 'update_payload' = Update specific payload fields on existing points.")
-    p.add_argument("--update_fields", default="ocr_text,youtube_link",
-                   help="Comma-separated payload fields to set if mode='update_payload'.")
+    p.add_argument("--mode", choices=["upsert", "update"], default="upsert",
+                   help="'upsert': Full point creation. 'update': Update specific payloads/vectors on existing points.")
+    p.add_argument("--update_payloads", default="ocr_text,youtube_link,timestamp_sec",
+                   help="Comma-separated payload fields to set (mode='update').")
+    p.add_argument("--update_vectors", default="keyframe-ocr-sparse",
+                   help="Comma-separated vector names to update (mode='update').")
     p.add_argument("--collection_name", default="keyframes_v1")
     p.add_argument("--batch_size", type=int, default=64,
                    help="Points per upsert batch (lower = less RAM, default: 64)")
@@ -483,15 +486,17 @@ def stream_upsert(
     return ok, fail
 
 
-# ── 13b. Update Payload (Fast Mode) generators ───────────────────────────────
-def generate_payload_updates(
+# ── 13b. Update Existing (Fast Mode) generators ──────────────────────────────
+def generate_updates(
     video_id: str,
     frame_indices: list[int] | None,
     det_lookup: dict[str, dict],
     ocr_lookup: dict[int, str],
     meta: dict,
-    update_fields: list[str]
-) -> Generator[SetPayloadOperation, None, None]:
+    update_payloads: list[str],
+    update_vectors: list[str]
+) -> Generator[tuple[str, dict, dict], None, None]:
+    """Yields (point_id, payload_dict, vectors_dict) for existing points."""
     fps = meta.get("fps", 1.0)
     source_url = meta.get("source_url", "")
 
@@ -506,17 +511,19 @@ def generate_payload_updates(
 
     for frame_idx in sorted(all_frames):
         payload = {}
+        vectors = {}
         
+        # 1. Payloads
         timestamp_sec = int(frame_idx / float(fps)) if fps > 0 else 0
         youtube_link = f"{source_url}&t={timestamp_sec}s" if source_url else ""
         
-        if "youtube_link" in update_fields:
+        if "youtube_link" in update_payloads:
             payload["youtube_link"] = youtube_link
-        if "timestamp_sec" in update_fields:
+        if "timestamp_sec" in update_payloads:
             payload["timestamp_sec"] = timestamp_sec
-        if "video_id" in update_fields:
+        if "video_id" in update_payloads:
             payload["video_id"] = video_id
-        if "frame_idx" in update_fields:
+        if "frame_idx" in update_payloads:
             payload["frame_idx"] = frame_idx
             
         image_id = f"{video_id}_{frame_idx:05d}"
@@ -524,45 +531,60 @@ def generate_payload_updates(
         if frame_result:
             m = extract_frame_metadata(frame_result)
             for k in ["tags", "caption", "detailed_caption", "object_counts"]:
-                if k in update_fields and k in m:
+                if k in update_payloads and k in m:
                     payload[k] = m[k]
                     
-        if "ocr_text" in update_fields:
-            ocr_text = ocr_lookup.get(frame_idx, "")
-            if ocr_text:
-                payload["ocr_text"] = ocr_text
+            if VEC_OBJECT_SPARSE in update_vectors and m["unique_tags"]:
+                obj_sparse = encode_bm25(" ".join(m["unique_tags"]))
+                if obj_sparse: vectors[VEC_OBJECT_SPARSE] = obj_sparse
+            if VEC_CAPTION_DENSE in update_vectors and m["detailed_caption"]:
+                cap_vec = encode_bge_m3(m["detailed_caption"])
+                if cap_vec: vectors[VEC_CAPTION_DENSE] = cap_vec
                 
-        if payload:
+        ocr_text = ocr_lookup.get(frame_idx, "")
+        if "ocr_text" in update_payloads and ocr_text:
+            payload["ocr_text"] = ocr_text
+            
+        if VEC_OCR_SPARSE in update_vectors and ocr_text:
+            ocr_sparse = encode_bm25(ocr_text)
+            if ocr_sparse: vectors[VEC_OCR_SPARSE] = ocr_sparse
+                
+        if payload or vectors:
             point_id = deterministic_id(video_id, frame_idx)
-            yield SetPayloadOperation(set_payload=payload, points=[point_id])
+            yield (point_id, payload, vectors)
 
-def stream_update_payload(
+def stream_updates(
     client: QdrantClient, col: str, op_gen: Generator, batch_size: int
 ) -> tuple[int, int]:
     ok = fail = b_num = 0
-    batch = []
-    for op in op_gen:
-        batch.append(op)
-        if len(batch) >= batch_size:
-            b_num += 1
-            try:
-                client.batch_update_points(collection_name=col, update_operations=batch)
-                ok += len(batch)
-                logger.info(f"  Batch {b_num}: payload updated for {len(batch)} pts (total OK: {ok})")
-            except Exception as e:
-                fail += len(batch)
-                logger.error(f"  Batch {b_num} failed: {e}")
-            batch.clear()
-
-    if batch:
+    payload_batch = []
+    vector_batch = []
+    
+    def _flush():
+        nonlocal ok, fail, b_num
         b_num += 1
         try:
-            client.batch_update_points(collection_name=col, update_operations=batch)
-            ok += len(batch)
-            logger.info(f"  Batch {b_num} (final): payload updated for {len(batch)} pts (total OK: {ok})")
+            if payload_batch:
+                client.batch_update_points(collection_name=col, update_operations=payload_batch)
+            if vector_batch:
+                client.update_vectors(collection_name=col, points=vector_batch)
+            ok += max(len(payload_batch), len(vector_batch))
+            logger.info(f"  Batch {b_num}: updated payload/vectors for pts (total OK: {ok})")
         except Exception as e:
-            fail += len(batch)
+            fail += max(len(payload_batch), len(vector_batch))
             logger.error(f"  Batch {b_num} failed: {e}")
+        payload_batch.clear()
+        vector_batch.clear()
+
+    for pid, payload, vecs in op_gen:
+        if payload: payload_batch.append(SetPayloadOperation(set_payload=payload, points=[pid]))
+        if vecs: vector_batch.append(PointVectors(id=pid, vector=vecs))
+        
+        if len(payload_batch) >= batch_size or len(vector_batch) >= batch_size:
+            _flush()
+
+    if payload_batch or vector_batch:
+        _flush()
             
     return ok, fail
 
@@ -617,7 +639,8 @@ def main() -> None:
 
     video_ids = sorted(video_map.keys())
     
-    update_fields = [f.strip() for f in args.update_fields.split(",") if f.strip()]
+    update_payloads = [f.strip() for f in args.update_payloads.split(",") if f.strip()]
+    update_vectors = [f.strip() for f in args.update_vectors.split(",") if f.strip()]
     
     for i, vid in enumerate(video_ids, 1):
         logger.info(f"[{i}/{len(video_ids)}] Processing: {vid}")
@@ -649,17 +672,17 @@ def main() -> None:
             
         vid_meta = meta_dict.get(vid, {})
 
-        if args.mode == "update_payload":
-            # ── Fast Payload Update Mode ─────────────────────────────
+        if args.mode == "update":
+            # ── Update Payload/Vector Mode ─────────────────────────────
             try:
-                op_gen = generate_payload_updates(
-                    vid, frame_indices, det_lookup, ocr_lookup, vid_meta, update_fields
+                op_gen = generate_updates(
+                    vid, frame_indices, det_lookup, ocr_lookup, vid_meta, update_payloads, update_vectors
                 )
-                ok, fail = stream_update_payload(qdrant, args.collection_name, op_gen, args.batch_size)
+                ok, fail = stream_updates(qdrant, args.collection_name, op_gen, args.batch_size)
                 total_ok += ok
                 total_fail += fail
             except Exception as exc:
-                logger.error(f"  Payload update failed for {vid}: {exc}")
+                logger.error(f"  Update failed for {vid}: {exc}")
             
             del frame_indices, det_lookup, ocr_lookup
             gc.collect()
