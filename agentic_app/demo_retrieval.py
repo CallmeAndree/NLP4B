@@ -379,7 +379,7 @@ PREFETCH_LIMIT    = 50                                     # 👈 Candidates per
 # 8. EXECUTE
 # ══════════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__" or "google.colab" in sys.modules or "ipykernel" in sys.modules:
+if __name__ == "__main__":
     if not QDRANT_URL or not QDRANT_API_KEY:
         console.print("[bold red]❌ Missing QDRANT_URL or QDRANT_API_KEY![/]")
         console.print("[yellow]Set them in the CONFIGURATION block above.[/]")
