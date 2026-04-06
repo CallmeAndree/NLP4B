@@ -1,0 +1,10 @@
+python==3.14.3
+langchain==1.2.7
+langchain-core==1.2.24
+python-dotenv==1.2.2
+pydantic==2.12.5
+qdrant-client==1.17.1
+
+# Optional LLM providers
+openai==2.30.0
+langchain-openai==1.1.12
