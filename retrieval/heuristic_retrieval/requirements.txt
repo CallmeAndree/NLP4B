@@ -11,3 +11,4 @@ qdrant-client>=1.9.0
 torch>=2.0.0
 transformers>=4.40.0        # SigLIP (AutoModel / AutoTokenizer)
 sentence-transformers>=3.0.0  # BGE-M3
+sentencepiece>=0.2.0        # Required for SigLIP Tokenizer
