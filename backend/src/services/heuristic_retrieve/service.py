@@ -269,7 +269,7 @@ def apply_count_bonus(
     rrf_pool: List[Dict[str, Any]],
     nlp_analysis: Dict[str, Any],
     top_k: int,
-    beta: float = 0.15,
+    beta: float = 0.4,
 ) -> List[Dict[str, Any]]:
     """
     Apply Count Bonus Multiplier on top of the RRF-ranked pool.
