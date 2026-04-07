@@ -25,27 +25,31 @@ logger = logging.getLogger(__name__)
 _nlp = None
 _wn_ready = False
 
-# Physical/visible object domains only
-VALID_LEXNAMES = frozenset({
-    # Core physical objects (original)
-    "noun.artifact",   # man-made objects: table, bowl, shirt, car, sign
-    "noun.person",     # person, officer, woman, man
-    "noun.animal",     # cat, dog, bird, horse, elephant
-    "noun.food",       # soup, rice, bread, fruit
-    "noun.plant",      # tree, flower, grass
-    "noun.body",       # hand, face, head, arm, leg
-    "noun.object",     # generic physical objects
-    "noun.substance",  # water, mud, wood, concrete
-    # Additional YOLO-relevant categories
-    "noun.group",      # people, crowd, herd, flock, team → YOLO counts groups
-    "noun.shape",      # sphere, cube, cone → geometric objects in scenes
-    "noun.location",   # street, road, sidewalk, area → YOLO scene context
+# ── Domain filter strategy: EXCLUDE abstract nouns ───────────────────────────
+# Instead of allowing specific categories (which misses edge cases),
+# we EXCLUDE known abstract/non-visual categories.
+# Anything not explicitly excluded is treated as potentially physical/visible.
+ABSTRACT_LEXNAMES = frozenset({
+    "noun.cognition",    # idea, concept, knowledge, memory
+    "noun.feeling",      # happiness, anger, fear
+    "noun.attribute",    # size, color, quality
+    "noun.act",          # action, behavior, movement
+    "noun.event",        # event, occasion, incident
+    "noun.time",         # time, moment, duration
+    "noun.process",      # process, growth, change
+    "noun.state",        # state, condition, health
+    "noun.relation",     # relation, connection, proportion
+    "noun.motive",       # reason, cause, purpose
+    "noun.phenomenon",   # phenomenon, effect
+    "noun.quantity",     # amount, number, measure
+    "noun.Tops",         # root/abstract tops
 })
 
 STOP_NOUNS = frozenset({
     "scene", "background", "view", "way", "thing",
     "time", "part", "end", "moment", "shot", "frame",
-    "setting", "exterior", "middle", "center",
+    "setting", "middle", "center", "type", "kind", "form",
+    "point", "line", "use", "case", "level", "side",
 })
 
 
@@ -85,11 +89,13 @@ def initialize():
 
 @lru_cache(maxsize=2048)
 def _is_valid(word: str) -> bool:
+    """Return True if word is a physical/visible noun (not purely abstract)."""
     from nltk.corpus import wordnet as wn
-    for syn in wn.synsets(word, pos=wn.NOUN)[:3]:
-        if syn.lexname() in VALID_LEXNAMES:
-            return True
-    return False
+    synsets = wn.synsets(word, pos=wn.NOUN)[:3]
+    if not synsets:
+        return False
+    # Valid if ANY top synset is not in the abstract list
+    return any(syn.lexname() not in ABSTRACT_LEXNAMES for syn in synsets)
 
 
 @lru_cache(maxsize=2048)
