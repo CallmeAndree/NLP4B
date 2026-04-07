@@ -27,17 +27,27 @@ _wn_ready = False
 
 # Physical/visible object domains only
 VALID_LEXNAMES = frozenset({
-    "noun.artifact", "noun.person", "noun.animal",
-    "noun.food", "noun.plant", "noun.body",
-    "noun.object", "noun.substance",
+    # Core physical objects (original)
+    "noun.artifact",   # man-made objects: table, bowl, shirt, car, sign
+    "noun.person",     # person, officer, woman, man
+    "noun.animal",     # cat, dog, bird, horse, elephant
+    "noun.food",       # soup, rice, bread, fruit
+    "noun.plant",      # tree, flower, grass
+    "noun.body",       # hand, face, head, arm, leg
+    "noun.object",     # generic physical objects
+    "noun.substance",  # water, mud, wood, concrete
+    # Additional YOLO-relevant categories
+    "noun.group",      # people, crowd, herd, flock, team → YOLO counts groups
+    "noun.shape",      # sphere, cube, cone → geometric objects in scenes
+    "noun.location",   # street, road, sidewalk, area → YOLO scene context
 })
 
 STOP_NOUNS = frozenset({
-    "scene", "background", "view", "area", "side", "way", "thing",
-    "time", "room", "place", "part", "end", "top", "bottom",
-    "left", "right", "front", "back", "middle", "center",
-    "interior", "exterior", "setting", "moment", "shot", "frame",
+    "scene", "background", "view", "way", "thing",
+    "time", "part", "end", "moment", "shot", "frame",
+    "setting", "exterior", "middle", "center",
 })
+
 
 OCR_PATTERN = re.compile(r"""["'\u201c\u201d\u2018\u2019]([^"'\u201c\u201d\u2018\u2019]+)["'\u201c\u201d\u2018\u2019]""")
 
@@ -99,7 +109,8 @@ def _synonyms(word: str, k: int = 3) -> Tuple[str, ...]:
 @dataclass
 class QueryAnalysis:
     original_query: str
-    objects: List[dict]
+    objects: List[dict]           # full objects with synonyms
+    object_counts: dict           # {object_name: count} — only objects WITH a count
     ocr_texts: List[str]
     object_search_text: str
     ocr_search_text: str
@@ -150,9 +161,17 @@ def process_query(text: str) -> QueryAnalysis:
     obj_text = " ".join(terms) if terms else clean
     ocr_text = " ".join(ocr_texts)
 
+    # 4. object_counts — {name: count} for objects with explicit numeric count
+    object_counts = {
+        o["object"]: o["count"]
+        for o in objects
+        if o["count"] is not None
+    }
+
     return QueryAnalysis(
         original_query=text,
         objects=objects,
+        object_counts=object_counts,
         ocr_texts=ocr_texts,
         object_search_text=obj_text,
         ocr_search_text=ocr_text,
