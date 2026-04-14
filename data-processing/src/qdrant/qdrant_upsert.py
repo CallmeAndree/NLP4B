@@ -552,23 +552,24 @@ def generate_points(
         image_id = f"{video_id}_{frame_idx:05d}"
         
         # Calculate Timestamp & YouTube Link
-        timestamp_sec = int(frame_idx / float(fps)) if fps > 0 else 0
-        youtube_link = f"{source_url}&t={timestamp_sec}s" if source_url else ""
+        calculated_sec = int(frame_idx / float(fps)) if fps > 0 else 0
 
-        # ── Dense vector (convert row then free ref) ─────────────────
-        dense_vec = embeddings[idx].tolist()
+        # ── Timestamp start/end from CSV (optional) ──────────────────
+        if ts_lookup and frame_idx in ts_lookup:
+            ts_start, ts_end = ts_lookup[frame_idx]
+            calculated_sec = int(ts_start)  # override with actual start time
+
+        youtube_link = f"{source_url}&t={calculated_sec}s" if source_url else ""
 
         # ── Base payload ─────────────────────────────────────────────
         vectors: dict = {VEC_DENSE: dense_vec}
         payload: dict = {
             "video_id": video_id,
             "frame_idx": frame_idx,
-            "timestamp_sec": timestamp_sec,
             "youtube_link": youtube_link,
             "azure_url": f"{azure_base_url}/{video_id}/{frame_filename}",
         }
 
-        # ── Timestamp start/end from CSV (optional) ──────────────────
         if ts_lookup and frame_idx in ts_lookup:
             ts_start, ts_end = ts_lookup[frame_idx]
             payload["timestamp_start"] = ts_start
@@ -678,25 +679,25 @@ def generate_updates(
         payload = {}
         vectors = {}
         
-        # 1. Payloads
-        timestamp_sec = int(frame_idx / float(fps)) if fps > 0 else 0
-        youtube_link = f"{source_url}&t={timestamp_sec}s" if source_url else ""
+        # 1. Payloads setup
+        calculated_sec = int(frame_idx / float(fps)) if fps > 0 else 0
         
-        if "youtube_link" in update_payloads:
-            payload["youtube_link"] = youtube_link
-        if "timestamp_sec" in update_payloads:
-            payload["timestamp_sec"] = timestamp_sec
-        if "video_id" in update_payloads:
-            payload["video_id"] = video_id
-        if "frame_idx" in update_payloads:
-            payload["frame_idx"] = frame_idx
-            
         if ts_lookup and frame_idx in ts_lookup:
             ts_start, ts_end = ts_lookup[frame_idx]
+            calculated_sec = int(ts_start)  # Use actual start time if available
             if "timestamp_start" in update_payloads:
                 payload["timestamp_start"] = ts_start
             if "timestamp_end" in update_payloads:
                 payload["timestamp_end"] = ts_end
+                
+        youtube_link = f"{source_url}&t={calculated_sec}s" if source_url else ""
+        
+        if "youtube_link" in update_payloads:
+            payload["youtube_link"] = youtube_link
+        if "video_id" in update_payloads:
+            payload["video_id"] = video_id
+        if "frame_idx" in update_payloads:
+            payload["frame_idx"] = frame_idx
             
         image_id = f"{video_id}_{frame_idx:05d}"
         frame_result = det_lookup.get(image_id) or det_lookup.get(f"{video_id}_{frame_idx}")
