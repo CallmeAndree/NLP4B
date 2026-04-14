@@ -148,6 +148,8 @@ def parse_args() -> argparse.Namespace:
                    help="Local dir with {video_id}.csv timestamp files (cols: keyframe_id, timestamp as [start,end])")
     p.add_argument("--skip_existing", action="store_true",
                    help="Skip points that already exist in Qdrant (avoid duplicates).")
+    p.add_argument("--siglip_only", action="store_true",
+                   help="Only upload SigLIP embeddings and basic metadata, ignore OCR and objects.")
     return p.parse_args()
 
 
@@ -296,14 +298,17 @@ def discover_video_ids(container: ContainerClient) -> dict[str, str]:
 def discover_detection_jsons(container: ContainerClient) -> dict[str, str]:
     """Find detection JSON blob paths by scanning detections container."""
     det_map = {}
-    for blob in container.list_blobs():
-        if blob.name.endswith(".json") or blob.name.endswith(".js"):
-            stem = Path(blob.name).stem
-            if stem.endswith("_object_detection"):
-                vid = stem.replace("_object_detection", "")
-            else:
-                vid = stem
-            det_map[vid] = blob.name
+    try:
+        for blob in container.list_blobs():
+            if blob.name.endswith(".json") or blob.name.endswith(".js"):
+                stem = Path(blob.name).stem
+                if stem.endswith("_object_detection"):
+                    vid = stem.replace("_object_detection", "")
+                else:
+                    vid = stem
+                det_map[vid] = blob.name
+    except Exception as e:
+        logger.warning(f"Could not list detections container: {e}")
     return det_map
 
 
@@ -763,8 +768,12 @@ def main() -> None:
 
     # ── Connect ──────────────────────────────────────────────────────
     emb_container = get_container_client(conn_str, args.embeddings_container)
-    det_container = get_container_client(conn_str, args.detections_container)
-    ocr_container = get_container_client(conn_str, args.ocr_container)
+    
+    det_container = None
+    ocr_container = None
+    if not args.siglip_only:
+        det_container = get_container_client(conn_str, args.detections_container)
+        ocr_container = get_container_client(conn_str, args.ocr_container)
     
     qdrant = QdrantClient(url=qdrant_url, api_key=qdrant_key)
     ensure_collection(qdrant, args.collection_name)
@@ -777,14 +786,16 @@ def main() -> None:
         logger.error(f"No .npy blobs in container '{args.embeddings_container}'")
         sys.exit(1)
         
-    det_map = discover_detection_jsons(det_container)
+    det_map = discover_detection_jsons(det_container) if det_container else {}
 
     logger.info("=" * 60)
     logger.info("Qdrant V2.1: 4-Vector Azure-Streaming Upsert (RAM-Optimized)")
     logger.info("=" * 60)
+    logger.info(f"SigLIP Only Mode: {args.siglip_only}")
     logger.info(f"Embeddings:  {args.embeddings_container}")
-    logger.info(f"Detections:  {args.detections_container}")
-    logger.info(f"OCR Stream:  {args.ocr_container}")
+    if not args.siglip_only:
+        logger.info(f"Detections:  {args.detections_container}")
+        logger.info(f"OCR Stream:  {args.ocr_container}")
     logger.info(f"Collection:  {args.collection_name}")
     logger.info(f"Batch size:  {args.batch_size}")
     logger.info(f"Videos:      {len(video_map)}")
@@ -809,23 +820,26 @@ def main() -> None:
         frame_indices = stream_json(emb_container, f"{emb_prefix}_frames.json")
 
         # ── Stream detection JSON ────────────────────────────────────
-        det_data = stream_json(det_container, det_blob) if det_blob else None
-        det_lookup = build_det_lookup(det_data)
-        
-        if det_data is not None:
-             del det_data
+        det_lookup = {}
+        if not args.siglip_only and det_blob and det_container:
+            det_data = stream_json(det_container, det_blob)
+            det_lookup = build_det_lookup(det_data)
+            if det_data is not None:
+                del det_data
 
         if det_lookup:
             n_det += 1
             logger.info(f"  Detection: {len(det_lookup)} frames loaded.")
         else:
             n_dense += 1
-            logger.warning(f"  No detection JSON → dense/OCR only")
+            logger.info(f"  No detection JSON → dense/metadata only")
 
         # ── Setup OCR lookup & Meta ──────────────────────────────────
-        ocr_lookup = build_ocr_lookup(ocr_container, vid)
-        if ocr_lookup:
-            logger.info(f"  OCR Text: {len(ocr_lookup)} mapped frames parsed via JSON.")
+        ocr_lookup = {}
+        if not args.siglip_only and ocr_container:
+            ocr_lookup = build_ocr_lookup(ocr_container, vid)
+            if ocr_lookup:
+                logger.info(f"  OCR Text: {len(ocr_lookup)} mapped frames parsed via JSON.")
             
         vid_meta = meta_dict.get(vid, {})
 
