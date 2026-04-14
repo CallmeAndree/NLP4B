@@ -144,6 +144,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--detections_container", default="object-detection")
     p.add_argument("--ocr_container", default="ocr", help="Azure container housing OCR results")
     p.add_argument("--video_metadata_link", default="", required=False, help="Path to local metadata CSV (optional)")
+    p.add_argument("--timestamp_dir", default="", required=False,
+                   help="Local dir with {video_id}.csv timestamp files (cols: keyframe_id, timestamp as [start,end])")
+    p.add_argument("--skip_existing", action="store_true",
+                   help="Skip points that already exist in Qdrant (avoid duplicates).")
     return p.parse_args()
 
 
@@ -167,6 +171,89 @@ def load_metadata_csv(csv_path: str) -> dict[str, dict]:
                 }
     logger.info(f"Loaded metadata for {len(meta_dict)} videos.")
     return meta_dict
+
+
+def load_timestamp_csv(timestamp_dir: str, video_id: str) -> dict[int, tuple[float, float]]:
+    """Load timestamp CSV for a video. Returns {frame_idx: (start_sec, end_sec)}.
+
+    Expected CSV format (tab or comma separated):
+        keyframe_id    timestamp
+        112            [0.0, 6.7]
+        150            [6.7, 12.3]
+    """
+    if not timestamp_dir:
+        return {}
+    csv_path = os.path.join(timestamp_dir, f"{video_id}.csv")
+    if not os.path.isfile(csv_path):
+        return {}
+
+    lookup: dict[int, tuple[float, float]] = {}
+    try:
+        df_ts = None
+        # Try reading with common delimiters
+        with open(csv_path, mode="r", encoding="utf-8-sig") as f:
+            first_line = f.readline()
+            delimiter = "\t" if "\t" in first_line else ","
+
+        with open(csv_path, mode="r", encoding="utf-8-sig") as f:
+            reader = csv.reader(f, delimiter=delimiter)
+            header = next(reader, None)
+            if not header:
+                return {}
+
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                try:
+                    frame_idx = int(row[0].strip())
+                except ValueError:
+                    continue
+
+                # Parse timestamp: could be "[0.0, 6.7]" or "0.0, 6.7" or two separate columns
+                ts_raw = ",".join(row[1:]).strip()
+                ts_raw = ts_raw.strip("[]").strip()
+                parts = [p.strip() for p in ts_raw.split(",")]
+                if len(parts) >= 2:
+                    try:
+                        start = float(parts[0])
+                        end = float(parts[1])
+                        lookup[frame_idx] = (start, end)
+                    except ValueError:
+                        continue
+
+        if lookup:
+            logger.info(f"  Timestamp CSV: {len(lookup)} frames loaded from {csv_path}")
+    except Exception as exc:
+        logger.warning(f"  Failed to load timestamp CSV {csv_path}: {exc}")
+
+    return lookup
+
+
+def check_existing_ids(
+    client: QdrantClient, collection: str, video_id: str
+) -> set[str]:
+    """Scroll through Qdrant to find existing point IDs for a given video_id."""
+    existing = set()
+    try:
+        offset = None
+        while True:
+            results, offset = client.scroll(
+                collection_name=collection,
+                scroll_filter={
+                    "must": [{"key": "video_id", "match": {"value": video_id}}]
+                },
+                limit=256,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            for pt in results:
+                existing.add(str(pt.id))
+            if offset is None:
+                break
+    except Exception as exc:
+        logger.warning(f"  Could not check existing IDs for {video_id}: {exc}")
+    return existing
 
 def get_container_client(conn_str: str, container: str) -> ContainerClient:
     return ContainerClient.from_connection_string(conn_str, container)
@@ -426,12 +513,20 @@ def generate_points(
     ocr_lookup: dict[int, str],
     meta: dict,
     azure_base_url: str,
+    ts_lookup: dict[int, tuple[float, float]] | None = None,
+    existing_ids: set[str] | None = None,
 ) -> Generator[PointStruct, None, None]:
     """
     Yield PointStruct one-by-one. Never holds the full list in memory.
     Yields 4 vectors immediately at upsert time and bundles OCR + YouTube link payloads.
+
+    If existing_ids is provided, points whose deterministic ID is already in the set
+    are silently skipped (--skip_existing behaviour).
+
+    If ts_lookup is provided, timestamp_start and timestamp_end are added to payload.
     """
     n_frames = embeddings.shape[0]
+    skipped = 0
     
     fps = meta.get("fps", 1.0)
     source_url = meta.get("source_url", "")
@@ -439,6 +534,13 @@ def generate_points(
     for idx in range(n_frames):
         # ── Frame index ──────────────────────────────────────────────
         frame_idx = int(frame_indices[idx]) if (frame_indices and idx < len(frame_indices)) else idx
+
+        # ── Skip existing ────────────────────────────────────────────
+        point_id = deterministic_id(video_id, frame_idx)
+        if existing_ids and point_id in existing_ids:
+            skipped += 1
+            continue
+
         frame_filename = f"{video_id}_{frame_idx:05d}.jpg"
         image_id = f"{video_id}_{frame_idx:05d}"
         
@@ -458,6 +560,12 @@ def generate_points(
             "youtube_link": youtube_link,
             "azure_url": f"{azure_base_url}/{video_id}/{frame_filename}",
         }
+
+        # ── Timestamp start/end from CSV (optional) ──────────────────
+        if ts_lookup and frame_idx in ts_lookup:
+            ts_start, ts_end = ts_lookup[frame_idx]
+            payload["timestamp_start"] = ts_start
+            payload["timestamp_end"] = ts_end
 
         # ── Detection metadata (optional) ────────────────────────────
         frame_result = det_lookup.get(image_id) or det_lookup.get(f"{video_id}_{frame_idx}")
@@ -488,10 +596,13 @@ def generate_points(
                 vectors[VEC_OCR_SPARSE] = ocr_sparse
 
         yield PointStruct(
-            id=deterministic_id(video_id, frame_idx),
+            id=point_id,
             vector=vectors,
             payload=payload,
         )
+
+    if skipped:
+        logger.info(f"  Skipped {skipped} already-existing point(s).")
 
 
 # ── 13. Streaming batch upsert (consumes generator in chunks) ────────────────
@@ -744,10 +855,21 @@ def main() -> None:
         n = embeddings.shape[0]
         logger.info(f"  {n} frames streamed ({embeddings.nbytes / 1e6:.1f} MB)")
 
+        # ── Check existing points (if --skip_existing) ───────────────
+        existing_ids = None
+        if args.skip_existing:
+            existing_ids = check_existing_ids(qdrant, args.collection_name, vid)
+            if existing_ids:
+                logger.info(f"  Found {len(existing_ids)} existing point(s) — will skip.")
+
+        # ── Load timestamp CSV (if --timestamp_dir) ──────────────────
+        ts_lookup = load_timestamp_csv(args.timestamp_dir, vid)
+
         # ── Stream-upsert via generator ──────────────────────────────
         try:
             point_gen = generate_points(
-                vid, embeddings, frame_indices, det_lookup, ocr_lookup, vid_meta, azure_base
+                vid, embeddings, frame_indices, det_lookup, ocr_lookup,
+                vid_meta, azure_base, ts_lookup, existing_ids,
             )
             ok, fail = stream_upsert(qdrant, args.collection_name, point_gen, args.batch_size)
             total_ok += ok
