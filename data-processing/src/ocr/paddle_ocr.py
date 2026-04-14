@@ -1,7 +1,6 @@
-
 """
 paddle_ocr.py — PaddleOCR-VL Keyframe OCR Pipeline
-====================================================
+==================================================
 Extracts text from keyframe images using PaddleOCR-VL 1.5.
 
 Output contract (per AGENTS.md):
@@ -26,11 +25,11 @@ from typing import Any
 import torch
 from PIL import Image
 from tqdm.auto import tqdm
-from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoConfig, AutoModel, AutoProcessor
 
 try:
     import psutil
-except Exception:  # pragma: no cover - optional dependency
+except Exception:
     psutil = None
 
 # ==========================================
@@ -44,6 +43,7 @@ logger = logging.getLogger(__name__)
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 
 DEFAULT_MODEL_ID = "PaddlePaddle/PaddleOCR-VL-1.5"
+DEFAULT_REVISION = "main"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 
@@ -85,32 +85,31 @@ def cleanup_memory() -> None:
 def prepare_hf_cache(
     model_id: str,
     cache_dir: str | Path,
-    revision: str = "main",
+    revision: str = DEFAULT_REVISION,
 ) -> str:
     """Pre-download model to a local cache directory."""
     from huggingface_hub import snapshot_download
 
     cache_dir = str(cache_dir)
-    logger.info(f"Preparing OCR model cache | model={model_id} | cache_dir={cache_dir}")
+    logger.info("Preparing OCR model cache | model=%s | cache_dir=%s", model_id, cache_dir)
     local_model_dir = snapshot_download(
         repo_id=model_id,
         revision=revision,
         cache_dir=cache_dir,
     )
-    logger.info(f"Model cache ready at: {local_model_dir}")
+    logger.info("Model cache ready at: %s", local_model_dir)
     return local_model_dir
 
 
 def resolve_model_source(
     model_id: str,
     hf_cache_dir: str | Path | None = None,
-    revision: str = "main",
+    revision: str = DEFAULT_REVISION,
     prepare_only: bool = False,
 ) -> str:
     """Return local model path when cache dir is provided, otherwise return original model id."""
-    is_local_path = Path(model_id).exists()
-    if is_local_path:
-        logger.info(f"Using local model path: {model_id}")
+    if Path(model_id).exists():
+        logger.info("Using local model path: %s", model_id)
         return str(Path(model_id))
 
     if hf_cache_dir:
@@ -122,48 +121,65 @@ def resolve_model_source(
     return model_id
 
 
+def resolve_torch_dtype(torch_dtype: str, runtime_device: str) -> torch.dtype:
+    """
+    Resolve dtype string to torch dtype.
+
+    Notes:
+    - On CUDA, float16 is the safest default for T4 / Kaggle.
+    - bfloat16 is only used if explicitly requested.
+    """
+    if torch_dtype == "auto":
+        return torch.float16 if runtime_device == "cuda" else torch.float32
+
+    mapping = {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+    }
+    if torch_dtype not in mapping:
+        raise ValueError(f"Unsupported torch_dtype: {torch_dtype}")
+    return mapping[torch_dtype]
+
+
 def load_model(
     model_id: str = DEFAULT_MODEL_ID,
     hf_cache_dir: str | Path | None = None,
-    revision: str = "main",
+    revision: str = DEFAULT_REVISION,
     device: str | None = None,
     torch_dtype: str = "auto",
 ) -> dict[str, Any]:
     """Load PaddleOCR-VL model and processor, returning a reusable runtime bundle."""
     runtime_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = (
-        torch.bfloat16
-        if torch_dtype == "auto"
-        else getattr(torch, torch_dtype)
-    )
+    dtype = resolve_torch_dtype(torch_dtype, runtime_device)
 
     log_system_state("Before model load")
 
     model_source = resolve_model_source(model_id, hf_cache_dir=hf_cache_dir, revision=revision)
     local_files_only = Path(model_source).exists()
 
-    logger.info(f"Loading PaddleOCR-VL config from: {model_source}")
+    logger.info("Loading PaddleOCR-VL config from: %s", model_source)
     config = AutoConfig.from_pretrained(
         model_source,
         trust_remote_code=True,
         local_files_only=local_files_only,
     )
-    # Some transformers versions require text_config to exist
+
+    # Some custom configs / older transformers versions may expect text_config
     if not hasattr(config, "text_config"):
         config.text_config = config
 
-    logger.info(f"Loading PaddleOCR-VL model | dtype={dtype} | device={runtime_device}")
-    model = AutoModelForImageTextToText.from_pretrained(
+    logger.info("Loading PaddleOCR-VL model | dtype=%s | device=%s", dtype, runtime_device)
+    model = AutoModel.from_pretrained(
         model_source,
         config=config,
         torch_dtype=dtype,
         trust_remote_code=True,
         local_files_only=local_files_only,
-        dtype=dtype,
     ).to(runtime_device).eval()
     logger.info("PaddleOCR-VL model loaded")
 
-    logger.info(f"Loading processor from: {model_source}")
+    logger.info("Loading processor from: %s", model_source)
     processor = AutoProcessor.from_pretrained(
         model_source,
         trust_remote_code=True,
@@ -190,27 +206,36 @@ def ocr_batch(
     runtime: dict[str, Any],
     max_new_tokens: int = 512,
 ) -> list[dict]:
-    """Run OCR on a batch of images, returning list of {"image": ..., "ocr_text": ...}."""
+    """Run OCR on a batch of images, returning list of {'image': ..., 'ocr_text': ...}."""
     model = runtime["model"]
     processor = runtime["processor"]
+    dtype = runtime["dtype"]
 
-    batch_images = []
-    valid_filenames = []
+    batch_images: list[Image.Image] = []
+    valid_filenames: list[str] = []
+
     for img_path in image_paths:
         try:
             with Image.open(img_path) as img:
                 batch_images.append(img.convert("RGB").copy())
                 valid_filenames.append(img_path.name)
-        except Exception as e:
-            logger.warning(f"Failed to open {img_path.name}: {e}")
-            continue
+        except Exception as exc:
+            logger.warning("Failed to open %s: %s", img_path.name, exc)
 
     if not batch_images:
         return []
 
     max_pixels = 1280 * 28 * 28
     batch_messages = [
-        [{"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": "OCR:"}]}]
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": "OCR:"},
+                ],
+            }
+        ]
         for img in batch_images
     ]
 
@@ -221,26 +246,38 @@ def ocr_batch(
         return_dict=True,
         return_tensors="pt",
         images_kwargs={"size": {"shortest_edge": 448, "longest_edge": max_pixels}},
-    ).to(model.device, dtype=runtime["dtype"])
+    )
+
+    prepared_inputs = {}
+    for key, value in inputs.items():
+        if hasattr(value, "to"):
+            if torch.is_floating_point(value):
+                prepared_inputs[key] = value.to(model.device, dtype=dtype)
+            else:
+                prepared_inputs[key] = value.to(model.device)
+        else:
+            prepared_inputs[key] = value
 
     outputs = model.generate(
-        **inputs,
+        **prepared_inputs,
         max_new_tokens=max_new_tokens,
         do_sample=False,
         use_cache=True,
         pad_token_id=processor.tokenizer.pad_token_id,
     )
 
-    prompt_len = inputs["input_ids"].shape[-1]
-    results = []
+    prompt_len = prepared_inputs["input_ids"].shape[-1]
+    results: list[dict] = []
     for idx, output_tensor in enumerate(outputs):
         text = processor.decode(output_tensor[prompt_len:-1], skip_special_tokens=True)
-        results.append({
-            "image": valid_filenames[idx],
-            "ocr_text": text.strip(),
-        })
+        results.append(
+            {
+                "image": valid_filenames[idx],
+                "ocr_text": text.strip(),
+            }
+        )
 
-    del inputs, outputs, batch_images
+    del inputs, prepared_inputs, outputs, batch_images
     return results
 
 
@@ -252,11 +289,11 @@ def discover_images(input_dir: Path) -> list[Path]:
     if not input_dir.is_dir():
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
 
-    images = sorted(
-        f for f in input_dir.iterdir()
+    return sorted(
+        f
+        for f in input_dir.iterdir()
         if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
     )
-    return images
 
 
 def save_ocr_results(output_file: Path, results: list[dict]) -> None:
@@ -275,12 +312,12 @@ def load_existing_results(output_file: Path) -> list[dict]:
     try:
         with open(output_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except Exception as e:
-        logger.warning(f"Could not load existing output {output_file}: {e}")
+    except Exception as exc:
+        logger.warning("Could not load existing output %s: %s", output_file, exc)
         return []
 
     if not isinstance(data, list):
-        logger.warning(f"Existing output {output_file} is not a JSON array. Starting fresh.")
+        logger.warning("Existing output %s is not a JSON array. Starting fresh.", output_file)
         return []
 
     deduped = []
@@ -295,7 +332,10 @@ def load_existing_results(output_file: Path) -> list[dict]:
         deduped.append(item)
 
     if len(deduped) != len(data):
-        logger.info(f"Removed {len(data) - len(deduped)} duplicate/invalid entries from existing output.")
+        logger.info(
+            "Removed %d duplicate/invalid entries from existing output.",
+            len(data) - len(deduped),
+        )
 
     return deduped
 
@@ -321,24 +361,26 @@ def process_directory(
     video_id = input_folder.name or input_folder.resolve().name or "unknown_video"
     output_file = output_folder / f"{video_id}_ocr.json"
 
-    # Resume from checkpoint
     all_results = load_existing_results(output_file)
     processed_images = {item["image"] for item in all_results}
     remaining_images = [img for img in image_files if img.name not in processed_images]
 
     logger.info(
-        f"Video {video_id} | total_images={len(image_files)} "
-        f"| already_processed={len(processed_images)} | remaining={len(remaining_images)}"
+        "Video %s | total_images=%d | already_processed=%d | remaining=%d",
+        video_id,
+        len(image_files),
+        len(processed_images),
+        len(remaining_images),
     )
 
     if not remaining_images:
         save_ocr_results(output_file, all_results)
-        logger.info(f"All images already processed for {video_id}. Output at {output_file}")
+        logger.info("All images already processed for %s. Output at %s", video_id, output_file)
         return output_file
 
-    # Torch performance optimizations
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
     processed_since_save = 0
     start_time = time.time()
@@ -358,20 +400,26 @@ def process_directory(
                 if save_every > 0 and processed_since_save >= save_every:
                     save_ocr_results(output_file, all_results)
                     logger.info(
-                        f"Checkpoint saved for {video_id} after {processed_since_save} images: {output_file}"
+                        "Checkpoint saved for %s after %d images: %s",
+                        video_id,
+                        processed_since_save,
+                        output_file,
                     )
                     processed_since_save = 0
-            except Exception as e:
-                logger.error(f"Batch failed at index {i}: {e}")
+            except Exception as exc:
+                logger.error("Batch failed at index %d: %s", i, exc)
                 traceback.print_exc()
             finally:
                 cleanup_memory()
 
-    # Final save
     save_ocr_results(output_file, all_results)
     elapsed = time.time() - start_time
     logger.info(
-        f"Done {video_id} | {len(all_results)} results saved to {output_file} | elapsed={elapsed:.1f}s"
+        "Done %s | %d results saved to %s | elapsed=%.1fs",
+        video_id,
+        len(all_results),
+        output_file,
+        elapsed,
     )
     return output_file
 
@@ -398,26 +446,30 @@ Examples:
     parser.add_argument("-i", "--input_dir", type=str, help="Path to directory containing keyframe images")
     parser.add_argument("-o", "--output_dir", type=str, default=".", help="Path to output directory for OCR JSONs")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL_ID, help="HuggingFace model ID or local path")
-    parser.add_argument("--revision", type=str, default="main", help="Pinned model revision / commit hash")
+    parser.add_argument("--revision", type=str, default=DEFAULT_REVISION, help="Pinned model revision / commit hash")
     parser.add_argument("--hf_cache_dir", type=str, default=None, help="HF cache dir for pre-downloading model")
     parser.add_argument("--prepare_only", action="store_true", help="Only pre-download model, then exit")
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "cpu"], help="Execution device")
     parser.add_argument(
-        "--torch_dtype", type=str, default="auto",
+        "--torch_dtype",
+        type=str,
+        default="auto",
         choices=["auto", "float16", "float32", "bfloat16"],
-        help="Model dtype (default: auto → bfloat16)",
+        help="Model dtype (default: auto → float16 on CUDA, float32 on CPU)",
     )
     parser.add_argument("--batch_size", type=int, default=6, help="Images per batch (default: 6, adjust for VRAM)")
     parser.add_argument("--max_new_tokens", type=int, default=512, help="Max tokens to generate per image")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of images to process (default: all)")
     parser.add_argument(
-        "--save_every", type=int, default=50,
+        "--save_every",
+        type=int,
+        default=50,
         help="Save checkpoint JSON every N images (0 disables periodic save)",
     )
     return parser
 
 
-def main():
+def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
@@ -425,7 +477,6 @@ def main():
     logger.info("PaddleOCR-VL Keyframe OCR Pipeline")
     logger.info("═" * 60)
 
-    # Handle prepare_only mode
     if args.prepare_only:
         model_source = resolve_model_source(
             model_id=args.model,
@@ -433,21 +484,20 @@ def main():
             revision=args.revision,
             prepare_only=True,
         )
-        logger.info(f"Prepare-only completed. Model source ready at: {model_source}")
+        logger.info("Prepare-only completed. Model source ready at: %s", model_source)
         return
 
     if not args.input_dir:
         parser.error("--input_dir / -i is required unless --prepare_only is used.")
 
-    logger.info(f"Input directory:  {args.input_dir}")
-    logger.info(f"Output directory: {args.output_dir}")
-    logger.info(f"Model:            {args.model}")
-    logger.info(f"Batch size:       {args.batch_size}")
-    logger.info(f"Max new tokens:   {args.max_new_tokens}")
+    logger.info("Input directory:  %s", args.input_dir)
+    logger.info("Output directory: %s", args.output_dir)
+    logger.info("Model:            %s", args.model)
+    logger.info("Batch size:       %s", args.batch_size)
+    logger.info("Max new tokens:   %s", args.max_new_tokens)
     if torch.cuda.is_available():
-        logger.info(f"CUDA device:      {torch.cuda.get_device_name(0)}")
+        logger.info("CUDA device:      %s", torch.cuda.get_device_name(0))
 
-    # Load model
     runtime = load_model(
         model_id=args.model,
         hf_cache_dir=args.hf_cache_dir,
@@ -456,7 +506,6 @@ def main():
         torch_dtype=args.torch_dtype,
     )
 
-    # Process
     process_directory(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
