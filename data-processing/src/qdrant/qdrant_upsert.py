@@ -656,7 +656,8 @@ def generate_updates(
     ocr_lookup: dict[int, str],
     meta: dict,
     update_payloads: list[str],
-    update_vectors: list[str]
+    update_vectors: list[str],
+    ts_lookup: dict[int, tuple[float, float]] | None = None,
 ) -> Generator[tuple[str, dict, dict], None, None]:
     """Yields (point_id, payload_dict, vectors_dict) for existing points."""
     fps = meta.get("fps", 1.0)
@@ -687,6 +688,13 @@ def generate_updates(
             payload["video_id"] = video_id
         if "frame_idx" in update_payloads:
             payload["frame_idx"] = frame_idx
+            
+        if ts_lookup and frame_idx in ts_lookup:
+            ts_start, ts_end = ts_lookup[frame_idx]
+            if "timestamp_start" in update_payloads:
+                payload["timestamp_start"] = ts_start
+            if "timestamp_end" in update_payloads:
+                payload["timestamp_end"] = ts_end
             
         image_id = f"{video_id}_{frame_idx:05d}"
         frame_result = det_lookup.get(image_id) or det_lookup.get(f"{video_id}_{frame_idx}")
@@ -842,12 +850,15 @@ def main() -> None:
                 logger.info(f"  OCR Text: {len(ocr_lookup)} mapped frames parsed via JSON.")
             
         vid_meta = meta_dict.get(vid, {})
+        
+        # ── Load timestamp CSV (if --timestamp_dir) ──────────────────
+        ts_lookup = load_timestamp_csv(args.timestamp_dir, vid)
 
         if args.mode == "update":
             # ── Update Payload/Vector Mode ─────────────────────────────
             try:
                 op_gen = generate_updates(
-                    vid, frame_indices, det_lookup, ocr_lookup, vid_meta, update_payloads, update_vectors
+                    vid, frame_indices, det_lookup, ocr_lookup, vid_meta, update_payloads, update_vectors, ts_lookup
                 )
                 ok, fail = stream_updates(qdrant, args.collection_name, op_gen, args.batch_size)
                 total_ok += ok
@@ -875,9 +886,6 @@ def main() -> None:
             existing_ids = check_existing_ids(qdrant, args.collection_name, vid)
             if existing_ids:
                 logger.info(f"  Found {len(existing_ids)} existing point(s) — will skip.")
-
-        # ── Load timestamp CSV (if --timestamp_dir) ──────────────────
-        ts_lookup = load_timestamp_csv(args.timestamp_dir, vid)
 
         # ── Stream-upsert via generator ──────────────────────────────
         try:
