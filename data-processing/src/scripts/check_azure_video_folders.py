@@ -85,8 +85,8 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     stem = csv_path.stem
-    exists_path = output_dir / f"{stem}_{args.container_name}_exists.csv"
-    missing_path = output_dir / f"{stem}_{args.container_name}_missing.csv"
+    exists_path = output_dir / f"{stem}_{args.container_name}_success.csv"
+    missing_path = output_dir / f"{stem}_{args.container_name}_failed.csv"
 
     pd.DataFrame({"video_id": exists_ids}).to_csv(exists_path, index=False, encoding="utf-8")
     pd.DataFrame({"video_id": missing_ids}).to_csv(missing_path, index=False, encoding="utf-8")
