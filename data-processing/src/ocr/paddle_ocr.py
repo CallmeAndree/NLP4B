@@ -1,15 +1,14 @@
 """
-paddle_ocr.py — PaddleOCR-VL Keyframe OCR Pipeline
-==================================================
-Extracts text from keyframe images using PaddleOCR-VL 1.5.
+paddle_ocr_restored.py — PaddleOCR-VL OCR pipeline (quality-restored version)
 
-Output contract (per AGENTS.md):
-  <video_id>_ocr.json — array of {"image": "<filename>", "ocr_text": "<text>"}
-
-Usage:
-  python -m src.ocr.paddle_ocr -i <keyframe_dir> -o <output_dir>
-  python -m src.ocr.paddle_ocr -i <keyframe_dir> -o <output_dir> --batch_size 4
-  python -m src.ocr.paddle_ocr --prepare_only --hf_cache_dir /path/to/cache
+Goal:
+- Preserve the inference behavior of the old working script as much as possible.
+- Add only the infrastructure features we need:
+  - HF cache pre-download
+  - local model path support
+  - prepare_only mode
+  - checkpoint / resume output JSON
+  - minimal transformers 5.x compatibility patch
 """
 
 import argparse
@@ -25,28 +24,38 @@ from typing import Any
 import torch
 from PIL import Image
 from tqdm.auto import tqdm
-from transformers import AutoConfig, AutoModel, AutoProcessor
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
-# ── Compatibility patch for PaddleOCR-VL 1.5 + transformers >= 5.0 ──
-# Issue 1: ROPE_INIT_FUNCTIONS["default"] was removed in transformers >= 5.0
-# Issue 2: transformers 5.x _init_weights expects RotaryEmbedding.compute_default_rope_parameters
+# ============================================================================
+# Minimal compatibility patch for PaddleOCR-VL 1.5 + transformers >= 5.x
+# Keep this as small as possible so we do not disturb the old inference path.
+# ============================================================================
 try:
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+    from transformers.modeling_utils import PreTrainedModel
+    import transformers.masking_utils
 
     def _compute_default_rope_parameters(config, device=None, seq_len=None, **kwargs):
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
         dim = int(head_dim * partial_rotary_factor)
-        base = config.rope_theta
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))
+        base = getattr(config, "rope_theta", 10000.0)
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.int64)
+                .float()
+                .to(device)
+                / dim
+            )
+        )
         attention_factor = 1.0
         return inv_freq, attention_factor
 
     if "default" not in ROPE_INIT_FUNCTIONS:
         ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
-
-    # Patch _init_weights to inject compute_default_rope_parameters on custom RotaryEmbedding
-    from transformers.modeling_utils import PreTrainedModel
 
     _orig_init_weights = PreTrainedModel._init_weights
 
@@ -61,55 +70,42 @@ try:
             module.compute_default_rope_parameters = (
                 lambda config=None, device=None, **kw: _compute_default_rope_parameters(
                     config or module.config,
-                    device=device or (module.inv_freq.device if hasattr(module, "inv_freq") else None),
+                    device=device
+                    or (
+                        module.inv_freq.device
+                        if hasattr(module, "inv_freq")
+                        else None
+                    ),
                 )
             )
         return _orig_init_weights(self, module)
 
     PreTrainedModel._init_weights = _patched_init_weights
 
-    # Patch create_causal_mask across transformers variants:
-    # - some versions use inputs_embeds
-    # - some use input_embeds
-    # - some use input_tensor
-    import transformers.masking_utils
-    import inspect
-
     _orig_create_causal_mask = transformers.masking_utils.create_causal_mask
 
     def _patched_create_causal_mask(*args, **kwargs):
-        sig = inspect.signature(_orig_create_causal_mask)
-        params = sig.parameters
-
-        # Normalize embed argument name across versions
+        # Retry different parameter names across transformers variants.
         if "inputs_embeds" in kwargs:
             val = kwargs.pop("inputs_embeds")
-            if "inputs_embeds" in params:
-                kwargs["inputs_embeds"] = val
-            elif "input_embeds" in params:
-                kwargs["input_embeds"] = val
-            elif "input_tensor" in params:
-                kwargs["input_tensor"] = val
+            candidate_names = ["inputs_embeds", "input_embeds", "input_tensor"]
 
-        if "input_embeds" in kwargs and "input_embeds" not in params:
-            val = kwargs.pop("input_embeds")
-            if "inputs_embeds" in params:
-                kwargs["inputs_embeds"] = val
-            elif "input_tensor" in params:
-                kwargs["input_tensor"] = val
-
-        if "input_tensor" in kwargs and "input_tensor" not in params:
-            val = kwargs.pop("input_tensor")
-            if "inputs_embeds" in params:
-                kwargs["inputs_embeds"] = val
-            elif "input_embeds" in params:
-                kwargs["input_embeds"] = val
-
-        accepts_var_kwargs = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
-        )
-        if not accepts_var_kwargs:
-            kwargs = {k: v for k, v in kwargs.items() if k in params}
+            last_exc = None
+            for name in candidate_names:
+                trial_kwargs = dict(kwargs)
+                trial_kwargs[name] = val
+                try:
+                    return _orig_create_causal_mask(*args, **trial_kwargs)
+                except TypeError as exc:
+                    last_exc = exc
+                    msg = str(exc)
+                    retryable = (
+                        "unexpected keyword argument" in msg
+                        or "missing 1 required positional argument" in msg
+                    )
+                    if not retryable:
+                        raise
+            raise last_exc
 
         return _orig_create_causal_mask(*args, **kwargs)
 
@@ -117,24 +113,27 @@ try:
 
 except ImportError:
     pass
-# ── End compatibility patch ──
 
+# ============================================================================
+# Optional dependency
+# ============================================================================
 try:
     import psutil
 except Exception:
     psutil = None
 
-# ==========================================
-# 0. LOGGING / SYSTEM HELPERS
-# ==========================================
+# ============================================================================
+# Logging / constants
+# ============================================================================
 LOG_FMT = "[%(asctime)s] [ocr] %(levelname)-8s %(message)s"
 DATE_FMT = "%Y-%m-%d %H:%M:%S"
 logging.basicConfig(level=logging.INFO, format=LOG_FMT, datefmt=DATE_FMT)
 logger = logging.getLogger(__name__)
 
-# Suppress verbose azure HTTP logs
 logging.getLogger("azure").setLevel(logging.WARNING)
-logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(
+    logging.WARNING
+)
 
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 
@@ -143,6 +142,9 @@ DEFAULT_REVISION = "main"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 
+# ============================================================================
+# Helpers
+# ============================================================================
 def log_system_state(prefix: str = "") -> None:
     parts = []
     if prefix:
@@ -164,7 +166,7 @@ def log_system_state(prefix: str = "") -> None:
     if psutil is not None:
         vm = psutil.virtual_memory()
         parts.append(f"ram_used_pct={vm.percent}")
-        parts.append(f"ram_available_gb={vm.available / (1024 ** 3):.2f}")
+        parts.append(f"ram_available_gb={vm.available / (1024**3):.2f}")
 
     logger.info(" | ".join(parts))
 
@@ -175,19 +177,35 @@ def cleanup_memory() -> None:
         torch.cuda.empty_cache()
 
 
-# ==========================================
-# 1. MODEL LOADING
-# ==========================================
+def resolve_torch_dtype(torch_dtype: str) -> torch.dtype:
+    # Keep old behavior as much as possible.
+    if torch_dtype == "auto":
+        return torch.bfloat16
+
+    mapping = {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+    }
+    if torch_dtype not in mapping:
+        raise ValueError(f"Unsupported torch_dtype: {torch_dtype}")
+    return mapping[torch_dtype]
+
+
+# ============================================================================
+# Model source / cache
+# ============================================================================
 def prepare_hf_cache(
     model_id: str,
     cache_dir: str | Path,
     revision: str = DEFAULT_REVISION,
 ) -> str:
-    """Pre-download model to a local cache directory."""
     from huggingface_hub import snapshot_download
 
     cache_dir = str(cache_dir)
-    logger.info("Preparing OCR model cache | model=%s | cache_dir=%s", model_id, cache_dir)
+    logger.info(
+        "Preparing OCR model cache | model=%s | cache_dir=%s", model_id, cache_dir
+    )
     local_model_dir = snapshot_download(
         repo_id=model_id,
         revision=revision,
@@ -203,7 +221,6 @@ def resolve_model_source(
     revision: str = DEFAULT_REVISION,
     prepare_only: bool = False,
 ) -> str:
-    """Return local model path when cache dir is provided, otherwise return original model id."""
     if Path(model_id).exists():
         logger.info("Using local model path: %s", model_id)
         return str(Path(model_id))
@@ -212,32 +229,16 @@ def resolve_model_source(
         return prepare_hf_cache(model_id, cache_dir=hf_cache_dir, revision=revision)
 
     if prepare_only:
-        raise ValueError("--prepare_only requires either a local --model path or --hf_cache_dir.")
+        raise ValueError(
+            "--prepare_only requires either a local --model path or --hf_cache_dir."
+        )
 
     return model_id
 
 
-def resolve_torch_dtype(torch_dtype: str, runtime_device: str) -> torch.dtype:
-    """
-    Resolve dtype string to torch dtype.
-
-    Notes:
-    - On CUDA, float16 is the safest default for T4 / Kaggle.
-    - bfloat16 is only used if explicitly requested.
-    """
-    if torch_dtype == "auto":
-        return torch.float16 if runtime_device == "cuda" else torch.float32
-
-    mapping = {
-        "float16": torch.float16,
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-    }
-    if torch_dtype not in mapping:
-        raise ValueError(f"Unsupported torch_dtype: {torch_dtype}")
-    return mapping[torch_dtype]
-
-
+# ============================================================================
+# Model loading
+# ============================================================================
 def load_model(
     model_id: str = DEFAULT_MODEL_ID,
     hf_cache_dir: str | Path | None = None,
@@ -245,13 +246,16 @@ def load_model(
     device: str | None = None,
     torch_dtype: str = "auto",
 ) -> dict[str, Any]:
-    """Load PaddleOCR-VL model and processor, returning a reusable runtime bundle."""
     runtime_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = resolve_torch_dtype(torch_dtype, runtime_device)
+    dtype = resolve_torch_dtype(torch_dtype)
 
     log_system_state("Before model load")
 
-    model_source = resolve_model_source(model_id, hf_cache_dir=hf_cache_dir, revision=revision)
+    model_source = resolve_model_source(
+        model_id=model_id,
+        hf_cache_dir=hf_cache_dir,
+        revision=revision,
+    )
     local_files_only = Path(model_source).exists()
 
     logger.info("Loading PaddleOCR-VL config from: %s", model_source)
@@ -261,17 +265,22 @@ def load_model(
         local_files_only=local_files_only,
     )
 
-    # Some custom configs / older transformers versions may expect text_config
+    # Preserve old workaround.
     if not hasattr(config, "text_config"):
         config.text_config = config
 
-    logger.info("Loading PaddleOCR-VL model | dtype=%s | device=%s", dtype, runtime_device)
-    model = AutoModel.from_pretrained(
+    logger.info(
+        "Loading PaddleOCR-VL model | dtype=%s | device=%s",
+        dtype,
+        runtime_device,
+    )
+    model = AutoModelForImageTextToText.from_pretrained(
         model_source,
         config=config,
         torch_dtype=dtype,
         trust_remote_code=True,
         local_files_only=local_files_only,
+        dtype=dtype,
     ).to(runtime_device).eval()
     logger.info("PaddleOCR-VL model loaded")
 
@@ -294,18 +303,19 @@ def load_model(
     }
 
 
-# ==========================================
-# 2. CORE OCR PIPELINE
-# ==========================================
+# ============================================================================
+# OCR core
+# ============================================================================
 def ocr_batch(
     image_paths: list[Path],
     runtime: dict[str, Any],
     max_new_tokens: int = 512,
 ) -> list[dict]:
-    """Run OCR on a batch of images, returning list of {'image': ..., 'ocr_text': ...}."""
+    """
+    Keep this path as close as possible to paddle_ocr_old.py.
+    """
     model = runtime["model"]
     processor = runtime["processor"]
-    dtype = runtime["dtype"]
 
     batch_images: list[Image.Image] = []
     valid_filenames: list[str] = []
@@ -335,6 +345,7 @@ def ocr_batch(
         for img in batch_images
     ]
 
+    # Preserve old behavior.
     inputs = processor.apply_chat_template(
         batch_messages,
         add_generation_prompt=True,
@@ -342,28 +353,19 @@ def ocr_batch(
         return_dict=True,
         return_tensors="pt",
         images_kwargs={"size": {"shortest_edge": 448, "longest_edge": max_pixels}},
-    )
-
-    prepared_inputs = {}
-    for key, value in inputs.items():
-        if hasattr(value, "to"):
-            if torch.is_floating_point(value):
-                prepared_inputs[key] = value.to(model.device, dtype=dtype)
-            else:
-                prepared_inputs[key] = value.to(model.device)
-        else:
-            prepared_inputs[key] = value
+    ).to(model.device, dtype=runtime["dtype"])
 
     outputs = model.generate(
-        **prepared_inputs,
+        **inputs,
         max_new_tokens=max_new_tokens,
         do_sample=False,
         use_cache=True,
         pad_token_id=processor.tokenizer.pad_token_id,
     )
 
-    prompt_len = prepared_inputs["input_ids"].shape[-1]
+    prompt_len = inputs["input_ids"].shape[-1]
     results: list[dict] = []
+
     for idx, output_tensor in enumerate(outputs):
         text = processor.decode(output_tensor[prompt_len:-1], skip_special_tokens=True)
         results.append(
@@ -373,15 +375,14 @@ def ocr_batch(
             }
         )
 
-    del inputs, prepared_inputs, outputs, batch_images
+    del inputs, outputs, batch_images
     return results
 
 
-# ==========================================
-# 3. DIRECTORY PROCESSING
-# ==========================================
+# ============================================================================
+# File IO / resume
+# ============================================================================
 def discover_images(input_dir: Path) -> list[Path]:
-    """Find all image files in a directory, sorted."""
     if not input_dir.is_dir():
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
 
@@ -393,7 +394,6 @@ def discover_images(input_dir: Path) -> list[Path]:
 
 
 def save_ocr_results(output_file: Path, results: list[dict]) -> None:
-    """Write OCR results atomically to avoid partial files."""
     tmp_file = output_file.with_suffix(output_file.suffix + ".tmp")
     with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
@@ -401,7 +401,6 @@ def save_ocr_results(output_file: Path, results: list[dict]) -> None:
 
 
 def load_existing_results(output_file: Path) -> list[dict]:
-    """Load previously saved OCR results for checkpoint resumption."""
     if not output_file.exists():
         return []
 
@@ -413,7 +412,9 @@ def load_existing_results(output_file: Path) -> list[dict]:
         return []
 
     if not isinstance(data, list):
-        logger.warning("Existing output %s is not a JSON array. Starting fresh.", output_file)
+        logger.warning(
+            "Existing output %s is not a JSON array. Starting fresh.", output_file
+        )
         return []
 
     deduped = []
@@ -436,6 +437,9 @@ def load_existing_results(output_file: Path) -> list[dict]:
     return deduped
 
 
+# ============================================================================
+# Directory processing
+# ============================================================================
 def process_directory(
     input_dir: str | Path,
     output_dir: str | Path,
@@ -445,7 +449,6 @@ def process_directory(
     save_every: int = 50,
     max_new_tokens: int = 512,
 ) -> Path:
-    """Process one video directory of keyframes, producing <video_id>_ocr.json."""
     input_folder = Path(input_dir)
     output_folder = Path(output_dir)
     output_folder.mkdir(parents=True, exist_ok=True)
@@ -489,7 +492,11 @@ def process_directory(
         ):
             batch_paths = remaining_images[i : i + batch_size]
             try:
-                batch_results = ocr_batch(batch_paths, runtime, max_new_tokens=max_new_tokens)
+                batch_results = ocr_batch(
+                    batch_paths,
+                    runtime,
+                    max_new_tokens=max_new_tokens,
+                )
                 all_results.extend(batch_results)
                 processed_since_save += len(batch_results)
 
@@ -520,42 +527,88 @@ def process_directory(
     return output_file
 
 
-# ==========================================
-# 4. CLI
-# ==========================================
+# ============================================================================
+# CLI
+# ============================================================================
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="PaddleOCR-VL Keyframe OCR Pipeline",
+        description="PaddleOCR-VL Keyframe OCR Pipeline (restored quality path)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Single video folder
-  python -m src.ocr.paddle_ocr -i ./keyframes/video_id -o ./ocr_output
-
-  # Pre-download model to cache
-  python -m src.ocr.paddle_ocr --prepare_only --hf_cache_dir ./hf_cache
-
-  # Use local model with custom batch size
-  python -m src.ocr.paddle_ocr -i ./keyframes/video_id -o ./ocr_output --model ./local_model --batch_size 4
+  python paddle_ocr_restored.py -i ./keyframes/video_id -o ./ocr_output
+  python paddle_ocr_restored.py -i ./keyframes/video_id -o ./ocr_output --batch_size 4
+  python paddle_ocr_restored.py --prepare_only --hf_cache_dir ./hf_cache
         """,
     )
-    parser.add_argument("-i", "--input_dir", type=str, help="Path to directory containing keyframe images")
-    parser.add_argument("-o", "--output_dir", type=str, default=".", help="Path to output directory for OCR JSONs")
-    parser.add_argument("--model", type=str, default=DEFAULT_MODEL_ID, help="HuggingFace model ID or local path")
-    parser.add_argument("--revision", type=str, default=DEFAULT_REVISION, help="Pinned model revision / commit hash")
-    parser.add_argument("--hf_cache_dir", type=str, default=None, help="HF cache dir for pre-downloading model")
-    parser.add_argument("--prepare_only", action="store_true", help="Only pre-download model, then exit")
-    parser.add_argument("--device", type=str, default=None, choices=["cuda", "cpu"], help="Execution device")
+    parser.add_argument(
+        "-i",
+        "--input_dir",
+        type=str,
+        help="Path to directory containing keyframe images",
+    )
+    parser.add_argument(
+        "-o",
+        "--output_dir",
+        type=str,
+        default=".",
+        help="Path to output directory for OCR JSONs",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL_ID,
+        help="HuggingFace model ID or local path",
+    )
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default=DEFAULT_REVISION,
+        help="Pinned model revision / commit hash",
+    )
+    parser.add_argument(
+        "--hf_cache_dir",
+        type=str,
+        default=None,
+        help="HF cache dir for pre-downloading model",
+    )
+    parser.add_argument(
+        "--prepare_only",
+        action="store_true",
+        help="Only pre-download model, then exit",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        choices=["cuda", "cpu"],
+        help="Execution device",
+    )
     parser.add_argument(
         "--torch_dtype",
         type=str,
         default="auto",
         choices=["auto", "float16", "float32", "bfloat16"],
-        help="Model dtype (default: auto → float16 on CUDA, float32 on CPU)",
+        help="Model dtype (default: auto -> bfloat16, same as old script)",
     )
-    parser.add_argument("--batch_size", type=int, default=6, help="Images per batch (default: 6, adjust for VRAM)")
-    parser.add_argument("--max_new_tokens", type=int, default=512, help="Max tokens to generate per image")
-    parser.add_argument("--limit", type=int, default=None, help="Limit number of images to process (default: all)")
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=6,
+        help="Images per batch",
+    )
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=512,
+        help="Max tokens to generate per image",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit number of images to process",
+    )
     parser.add_argument(
         "--save_every",
         type=int,
@@ -570,7 +623,7 @@ def main() -> None:
     args = parser.parse_args()
 
     logger.info("═" * 60)
-    logger.info("PaddleOCR-VL Keyframe OCR Pipeline")
+    logger.info("PaddleOCR-VL Keyframe OCR Pipeline (restored quality path)")
     logger.info("═" * 60)
 
     if args.prepare_only:
