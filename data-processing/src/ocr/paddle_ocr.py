@@ -68,6 +68,31 @@ try:
 
     PreTrainedModel._init_weights = _patched_init_weights
 
+    # Patch create_causal_mask which changed signature in transformers 5.0 (inputs_embeds -> input_tensor)
+    import transformers.masking_utils
+    import inspect
+
+    _orig_create_causal_mask = transformers.masking_utils.create_causal_mask
+
+    def _patched_create_causal_mask(*args, **kwargs):
+        sig = inspect.signature(_orig_create_causal_mask)
+        params = sig.parameters
+        
+        if "inputs_embeds" in kwargs and "inputs_embeds" not in params:
+            val = kwargs.pop("inputs_embeds")
+            # If the new signature expects input_tensor, map it
+            if "input_tensor" in params:
+                kwargs["input_tensor"] = val
+                
+        # Filter out any other kwargs not accepted by the current transformers version
+        filtered_kwargs = {
+            k: v for k, v in kwargs.items() 
+            if k in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        }
+        return _orig_create_causal_mask(*args, **filtered_kwargs)
+
+    transformers.masking_utils.create_causal_mask = _patched_create_causal_mask
+
 except ImportError:
     pass
 # ── End compatibility patch ──
@@ -84,6 +109,10 @@ LOG_FMT = "[%(asctime)s] [ocr] %(levelname)-8s %(message)s"
 DATE_FMT = "%Y-%m-%d %H:%M:%S"
 logging.basicConfig(level=logging.INFO, format=LOG_FMT, datefmt=DATE_FMT)
 logger = logging.getLogger(__name__)
+
+# Suppress verbose azure HTTP logs
+logging.getLogger("azure").setLevel(logging.WARNING)
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
 
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 
