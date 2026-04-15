@@ -68,7 +68,10 @@ try:
 
     PreTrainedModel._init_weights = _patched_init_weights
 
-    # Patch create_causal_mask which changed signature in transformers 5.0 (inputs_embeds -> input_tensor)
+    # Patch create_causal_mask across transformers variants:
+    # - some versions use inputs_embeds
+    # - some use input_embeds
+    # - some use input_tensor
     import transformers.masking_utils
     import inspect
 
@@ -77,19 +80,38 @@ try:
     def _patched_create_causal_mask(*args, **kwargs):
         sig = inspect.signature(_orig_create_causal_mask)
         params = sig.parameters
-        
-        if "inputs_embeds" in kwargs and "inputs_embeds" not in params:
+
+        # Normalize embed argument name across versions
+        if "inputs_embeds" in kwargs:
             val = kwargs.pop("inputs_embeds")
-            # If the new signature expects input_tensor, map it
-            if "input_tensor" in params:
+            if "inputs_embeds" in params:
+                kwargs["inputs_embeds"] = val
+            elif "input_embeds" in params:
+                kwargs["input_embeds"] = val
+            elif "input_tensor" in params:
                 kwargs["input_tensor"] = val
-                
-        # Filter out any other kwargs not accepted by the current transformers version
-        filtered_kwargs = {
-            k: v for k, v in kwargs.items() 
-            if k in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-        }
-        return _orig_create_causal_mask(*args, **filtered_kwargs)
+
+        if "input_embeds" in kwargs and "input_embeds" not in params:
+            val = kwargs.pop("input_embeds")
+            if "inputs_embeds" in params:
+                kwargs["inputs_embeds"] = val
+            elif "input_tensor" in params:
+                kwargs["input_tensor"] = val
+
+        if "input_tensor" in kwargs and "input_tensor" not in params:
+            val = kwargs.pop("input_tensor")
+            if "inputs_embeds" in params:
+                kwargs["inputs_embeds"] = val
+            elif "input_embeds" in params:
+                kwargs["input_embeds"] = val
+
+        accepts_var_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        if not accepts_var_kwargs:
+            kwargs = {k: v for k, v in kwargs.items() if k in params}
+
+        return _orig_create_causal_mask(*args, **kwargs)
 
     transformers.masking_utils.create_causal_mask = _patched_create_causal_mask
 
