@@ -27,6 +27,51 @@ from PIL import Image
 from tqdm.auto import tqdm
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
+# ── Compatibility patch for PaddleOCR-VL 1.5 + transformers >= 5.0 ──
+# Issue 1: ROPE_INIT_FUNCTIONS["default"] was removed in transformers >= 5.0
+# Issue 2: transformers 5.x _init_weights expects RotaryEmbedding.compute_default_rope_parameters
+try:
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    def _compute_default_rope_parameters(config, device=None, seq_len=None, **kwargs):
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        dim = int(head_dim * partial_rotary_factor)
+        base = config.rope_theta
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))
+        attention_factor = 1.0
+        return inv_freq, attention_factor
+
+    if "default" not in ROPE_INIT_FUNCTIONS:
+        ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
+
+    # Patch _init_weights to inject compute_default_rope_parameters on custom RotaryEmbedding
+    from transformers.modeling_utils import PreTrainedModel
+
+    _orig_init_weights = PreTrainedModel._init_weights
+
+    @torch.no_grad()
+    def _patched_init_weights(self, module):
+        if (
+            "RotaryEmbedding" in module.__class__.__name__
+            and hasattr(module, "rope_type")
+            and module.rope_type == "default"
+            and not hasattr(module, "compute_default_rope_parameters")
+        ):
+            module.compute_default_rope_parameters = (
+                lambda config=None, device=None, **kw: _compute_default_rope_parameters(
+                    config or module.config,
+                    device=device or (module.inv_freq.device if hasattr(module, "inv_freq") else None),
+                )
+            )
+        return _orig_init_weights(self, module)
+
+    PreTrainedModel._init_weights = _patched_init_weights
+
+except ImportError:
+    pass
+# ── End compatibility patch ──
+
 try:
     import psutil
 except Exception:
