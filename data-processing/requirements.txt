@@ -22,6 +22,10 @@ notebook>=7.2
 streamlit>=1.37
 
 # Retrieval / ML (can be skipped at the very beginning if needed)
+# --extra-index-url https://download.pytorch.org/whl/cu121
+# torch
+# torchvision
+# torchaudio
 accelerate==1.13.0
 einops>=0.8.2
 faiss-cpu>=1.8.0
