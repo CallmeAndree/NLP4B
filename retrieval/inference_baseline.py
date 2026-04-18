@@ -11,6 +11,15 @@ from sentence_transformers import SentenceTransformer
 # Load các biến môi trường từ file .env
 load_dotenv()
 
+
+'''
+python inference_baseline.py --csv_path "filtered_longvale_annotations.csv"  
+                    --output_file ket_qua_search.json 
+                    --id_start 0 
+                    --id_end 3   
+                    --k 5
+'''
+
 def check_overlap(gt_start, gt_end, ret_start, ret_end):
     """Kiểm tra xem timestamp của frame tìm được có nằm trong khoảng ground truth không"""
     return max(gt_start, ret_start) <= min(gt_end, ret_end)

@@ -6,6 +6,16 @@ import argparse
 import json
 import requests
 
+'''
+python inference.py --csv_path "filtered_longvale_annotations.csv"  
+                    --endpoint search/heuristic # search | search/heuristic | search/agentic
+                    --output_file ket_qua_search.json 
+                    --id_start 0 
+                    --id_end 3   
+                    --k 5
+'''
+
+
 def check_overlap(gt_start, gt_end, ret_start, ret_end):
     if ret_start is None or ret_end is None:
         return False
