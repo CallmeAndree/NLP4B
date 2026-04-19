@@ -116,7 +116,7 @@ def run_api_inference(csv_path, base_url, endpoint, k=5, id_start=0, id_end=None
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv_path", type=str, required=True)
-    parser.add_argument("--base_url", type=str, default="http://localhost:8000")
+    parser.add_argument("--base_url", type=str, default="https://nlp4b.vercel.app")
     parser.add_argument("--endpoint", type=str, required=True, help="Điền endpoint (vd: search, heuristic, agentic)")
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--id_start", type=int, default=0)
