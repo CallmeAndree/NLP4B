@@ -9,7 +9,7 @@ st.set_page_config(
     page_title="LookUp.ai",
     page_icon="✨",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # ── Global stylesheet ─────────────────────────────────────────────────────────
@@ -19,6 +19,40 @@ with open(os.path.join(BASE_DIR, "assets", "styles", "main.css"), "r", encoding=
     _APP_CSS = css_file.read()
 
 st.markdown(f"<style>{_APP_CSS}</style>", unsafe_allow_html=True)
+
+# Absolute Logo (Fixed at Top-Left)
+st.markdown(
+    '<a href="/" target="_self" class="absolute-brand-logo" title="Về trang chủ">LookUp.ai</a>',
+    unsafe_allow_html=True
+)
+
+# Fix nút toggle sidebar: thay icon lỗi (keyboard_double_arrow text) bằng SVG chevron
+st.markdown("""
+<script>
+(function fixSidebarToggle() {
+    const CHEVRON_RIGHT = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#6b7280" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>';
+    const CHEVRON_LEFT  = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#6b7280" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>';
+
+    function patchBtn() {
+        // Nút mở sidebar khi đang đóng
+        const expandBtn = document.querySelector('[data-testid="stSidebarCollapsedControl"] button');
+        if (expandBtn) {
+            const svg = expandBtn.querySelector('svg');
+            if (!svg) expandBtn.innerHTML = CHEVRON_RIGHT;
+        }
+        // Nút đóng sidebar khi đang mở (nằm trong header)
+        const collapseBtn = document.querySelector('[data-testid="stExpandSidebarButton"]');
+        if (collapseBtn) {
+            const svg = collapseBtn.querySelector('svg');
+            if (!svg) collapseBtn.innerHTML = CHEVRON_LEFT;
+        }
+    }
+
+    patchBtn();
+    setInterval(patchBtn, 800);
+})();
+</script>
+""", unsafe_allow_html=True)
 
 import os
 
@@ -30,6 +64,12 @@ SCORE_BAR_MAX_PCT = 100
 CARD_HEIGHT_PX = 320
 MIN_IFRAME_HEIGHT_PX = 400
 CARDS_PER_ROW = 2
+
+STRATEGY_OPTIONS = {
+    "🔀 Cả hai (RRF Fusion)": "both",
+    "🤖 Agentic": "agentic",
+    "📊 Heuristic (Normal)": "heuristic",
+}
 
 BRANCH_COLORS = {
     "agentic": "#6366f1",
@@ -65,22 +105,22 @@ def escape_html(value) -> str:
     return html.escape(str(value or ""))
 
 
-def call_search_api(query: str, top_k: int = DEFAULT_TOP_K) -> dict | None:
+def call_search_api(query: str, top_k: int = DEFAULT_TOP_K, strategy: str = "both") -> dict | None:
     """POST /search to the unified backend API."""
     try:
         resp = requests.post(
             f"{API_BASE_URL}/search",
-            json={"raw_query": query, "top_k": top_k},
+            json={"raw_query": query, "top_k": top_k, "strategy": strategy},
             timeout=120,
         )
         resp.raise_for_status()
         return resp.json()
     except requests.exceptions.ConnectionError:
-        st.error("❌ Không thể kết nối tới backend. Hãy chắc chắn FastAPI đang chạy tại `localhost:8000`.")
+        st.error("Không thể kết nối tới backend. Hãy chắc chắn FastAPI đang chạy tại `localhost:8000`.")
     except requests.exceptions.Timeout:
-        st.error("⏱️ Request timeout — server mất quá nhiều thời gian phản hồi.")
+        st.error("Request timeout — server mất quá nhiều thời gian phản hồi.")
     except requests.exceptions.HTTPError as exc:
-        st.error(f"⚠️ API lỗi: {exc.response.status_code} — {exc.response.text[:200]}")
+        st.error(f"API lỗi: {exc.response.status_code} — {exc.response.text[:200]}")
     return None
 
 
@@ -186,13 +226,18 @@ def render_latency_badge(latency: dict) -> str:
     heuristic = latency.get("heuristic_ms", 0)
     rerank = latency.get("rerank_ms", 0)
     total = latency.get("total_ms", 0)
-    return f"""\
-<div class="latency-bar">
-  <span class="lat-chip enc">🤖 Agentic {agentic:.0f}ms</span>
-  <span class="lat-chip srch">📊 Heuristic {heuristic:.0f}ms</span>
-  <span class="lat-chip" style="background:rgba(245,158,11,0.15);color:#f59e0b;">🔀 Rerank {rerank:.0f}ms</span>
-  <span class="lat-chip tot">🕐 Total {total:.0f}ms</span>
-</div>"""
+    
+    parts = []
+    if agentic > 0:
+        parts.append(f'<span class="lat-chip enc">🤖 Agentic {agentic:.0f}ms</span>')
+    if heuristic > 0:
+        parts.append(f'<span class="lat-chip srch">📊 Heuristic {heuristic:.0f}ms</span>')
+    if rerank > 0:
+        parts.append(f'<span class="lat-chip" style="background:rgba(245,158,11,0.15);color:#f59e0b;">🔀 Rerank {rerank:.0f}ms</span>')
+    parts.append(f'<span class="lat-chip tot">🕐 Total {total:.0f}ms</span>')
+    
+    inner_html = "".join(parts)
+    return f'<div class="latency-bar">{inner_html}</div>'
 
 
 # ── Iframe builder ────────────────────────────────────────────────────────────
@@ -238,8 +283,67 @@ def build_cards_iframe(results: list[dict]) -> tuple[str, int]:
     return full_html, height
 
 
-# ── UI: Brand logo ────────────────────────────────────────────────────────────
-st.markdown('<a href="/" target="_self" class="brand-logo" title="Về trang chủ">LookUp.ai</a>', unsafe_allow_html=True)
+# ── UI: Sidebar settings ───────────────────────────────────────────────────
+with st.sidebar:
+    # Break ra một chút khoảng trống trên cùng vì logo đã là absolute fixed
+    st.markdown('<div class="sidebar-section-label" style="margin-top: 24px;">🎯 Kết quả trả về</div>', unsafe_allow_html=True)
+    top_k = st.slider(
+        label="top_k_hidden",
+        min_value=1,
+        max_value=50,
+        value=st.session_state.get("top_k", DEFAULT_TOP_K),
+        step=1,
+        label_visibility="collapsed",
+        key="top_k_slider",
+        help="Số lượng kết quả tối đa hiển thị",
+    )
+    st.markdown(
+        f'<div class="sidebar-k-badge">Top <span>{top_k}</span> kết quả</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section-label">🔍 Chiến lược tìm kiếm</div>', unsafe_allow_html=True)
+
+    strategy_label = st.radio(
+        label="strategy_hidden",
+        options=list(STRATEGY_OPTIONS.keys()),
+        index=list(STRATEGY_OPTIONS.keys()).index(
+            st.session_state.get("strategy_label", "🔀 Cả hai (RRF Fusion)")
+        ),
+        label_visibility="collapsed",
+        key="strategy_radio",
+    )
+    strategy = STRATEGY_OPTIONS[strategy_label]
+
+    st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
+
+    _STRATEGY_BADGE_TEXT = {
+        "agentic":   "🤖 Agentic Intent-Aware",
+        "heuristic": "📊 Heuristic Dense+Sparse",
+        "both":      "🔀 RRF Fusion (cả hai)",
+    }
+    _STRATEGY_DESC_TEXT = {
+        "agentic":   "Phân tích truy vấn qua LLM, phù hợp truy vấn phức tạp.",
+        "heuristic": "Vector search thuần túy, nhanh và hiệu quả cho truy vấn đơn giản.",
+        "both":      "Kết hợp đa dạng qua Reciprocal Rank Fusion, chất lượng tốt nhất.",
+    }
+
+    st.markdown(
+        f"""\
+<div class="sidebar-strategy-info">
+  <div class="strategy-badge {strategy}">{_STRATEGY_BADGE_TEXT[strategy]}</div>
+  <div class="strategy-desc">{_STRATEGY_DESC_TEXT[strategy]}</div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+
+    # Persist selections in session so a rerun keeps them
+    st.session_state["top_k"] = top_k
+    st.session_state["strategy_label"] = strategy_label
+    st.session_state["strategy"] = strategy
+
+# ── UI: Idle hero (shown only when no results) ────────────────────────────────
 
 # ── UI: Idle hero (shown only when no results) ────────────────────────────────
 hero_placeholder = st.empty()
@@ -308,16 +412,32 @@ if "results_data" in st.session_state:
 # ── UI: Search input (fixed bottom) ──────────────────────────────────────────
 search_query = st.chat_input("Mô tả cảnh bạn muốn tìm...")
 
-if search_query:
+# Kiểm tra xem tham số (strategy, top_k) có thay đổi so với lần search cuối không
+params_changed = False
+if "last_query" in st.session_state:
+    if st.session_state.get("strategy") != st.session_state.get("last_strategy"):
+        params_changed = True
+    if st.session_state.get("top_k") != st.session_state.get("last_top_k"):
+        params_changed = True
+
+# Trigger search nếu có submit mới từ chat_input, HOẶC tham số thay đổi
+query_to_run = search_query if search_query else (st.session_state.get("last_query") if params_changed else None)
+
+if query_to_run:
     hero_placeholder.empty()
-    
+
+    current_top_k = st.session_state.get("top_k", DEFAULT_TOP_K)
+    current_strategy = st.session_state.get("strategy", "both")
+
     spinner = st.empty()
     spinner.markdown(SPINNER_HTML, unsafe_allow_html=True)
 
-    data = call_search_api(search_query, top_k=DEFAULT_TOP_K)
+    data = call_search_api(query_to_run, top_k=current_top_k, strategy=current_strategy)
     spinner.empty()
 
     if data:
         st.session_state["results_data"] = data
-        st.session_state["last_query"] = search_query
+        st.session_state["last_query"] = query_to_run
+        st.session_state["last_strategy"] = current_strategy
+        st.session_state["last_top_k"] = current_top_k
         st.rerun()
