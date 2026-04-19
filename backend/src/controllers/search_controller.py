@@ -109,25 +109,25 @@ def execute_search(
                     heuristic_results, heuristic_ms = fut.result()
 
     # ── 2. Rerank / pass-through ───────────────────────────────────────────────
-    t_rerank = time.perf_counter()
-
     if strategy == "both":
+        t_rerank = time.perf_counter()
         final_candidates = cross_source_rerank(
             agentic_results=agentic_results,
             heuristic_results=heuristic_results,
             top_k=top_k,
         )
+        rerank_ms = (time.perf_counter() - t_rerank) * 1000
     elif strategy == "agentic":
         # Tag branch and slice to top_k directly — no fusion needed
         for c in agentic_results:
             c["branch"] = "agentic"
         final_candidates = agentic_results[:top_k]
+        rerank_ms = 0.0
     else:  # heuristic only
         for c in heuristic_results:
             c["branch"] = "heuristic"
         final_candidates = heuristic_results[:top_k]
-
-    rerank_ms = (time.perf_counter() - t_rerank) * 1000
+        rerank_ms = 0.0
 
     # ── 3. Build response ──────────────────────────────────────────────────────
     total_ms = (time.perf_counter() - t_start) * 1000

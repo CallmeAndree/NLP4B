@@ -61,7 +61,7 @@ API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000")
 DEFAULT_TOP_K = 10
 SCORE_BAR_SCALE = 2000
 SCORE_BAR_MAX_PCT = 100
-CARD_HEIGHT_PX = 320
+CARD_HEIGHT_PX = 380
 MIN_IFRAME_HEIGHT_PX = 400
 CARDS_PER_ROW = 2
 
@@ -277,7 +277,7 @@ def build_cards_iframe(results: list[dict]) -> tuple[str, int]:
     )
     rows = (len(results) + CARDS_PER_ROW - 1) // CARDS_PER_ROW
     gap_px = 20
-    padding_px = 20
+    padding_px = 140
     calculated_height = (rows * CARD_HEIGHT_PX) + max(0, rows - 1) * gap_px + padding_px
     height = max(calculated_height, MIN_IFRAME_HEIGHT_PX)
     return full_html, height
@@ -342,8 +342,6 @@ with st.sidebar:
     st.session_state["top_k"] = top_k
     st.session_state["strategy_label"] = strategy_label
     st.session_state["strategy"] = strategy
-
-# ── UI: Idle hero (shown only when no results) ────────────────────────────────
 
 # ── UI: Idle hero (shown only when no results) ────────────────────────────────
 hero_placeholder = st.empty()
@@ -432,12 +430,12 @@ if query_to_run:
     spinner = st.empty()
     spinner.markdown(SPINNER_HTML, unsafe_allow_html=True)
 
-    data = call_search_api(query_to_run, top_k=current_top_k, strategy=current_strategy)
+    data = call_search_api(search_query, top_k=current_top_k, strategy=current_strategy)
     spinner.empty()
 
     if data:
         st.session_state["results_data"] = data
-        st.session_state["last_query"] = query_to_run
+        st.session_state["last_query"] = search_query
         st.session_state["last_strategy"] = current_strategy
         st.session_state["last_top_k"] = current_top_k
         st.rerun()
