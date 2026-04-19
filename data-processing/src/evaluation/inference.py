@@ -68,6 +68,7 @@ logger = logging.getLogger("inference")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DEFAULT_API_URL = "https://nlp4b.vercel.app"
+# DEFAULT_API_URL = "http://localhost:8000"
 DEFAULT_CSV_PATH = "data/longvale_test.csv"
 DEFAULT_OUTPUT_DIR = "output/evaluation"
 DEFAULT_TOP_K = 5
@@ -165,29 +166,14 @@ def _csv_header(top_k: int) -> List[str]:
     base = [
         "query_idx",
         "video_id_gt",
-        "duration_gt",
         "timestamp_start_gt",
         "timestamp_end_gt",
         "query_text",
         "strategy",
-        "top_k",
-        "num_results",
-        "latency_total_ms",
-        "latency_agentic_ms",
-        "latency_heuristic_ms",
-        "latency_rerank_ms",
         "latency_server_total_ms",
-        "error",
     ]
     for i in range(1, top_k + 1):
-        base.extend([
-            f"result_{i}_video_id",
-            f"result_{i}_frame_id",
-            f"result_{i}_score",
-            f"result_{i}_branch",
-            f"result_{i}_timestamp_start",
-            f"result_{i}_timestamp_end",
-        ])
+        base.append(f"keyframe_{i}")
     return base
 
 
@@ -203,50 +189,36 @@ def build_result_row(
     row: Dict[str, Any] = {
         "query_idx": query_row["query_idx"],
         "video_id_gt": query_row["video_id"],
-        "duration_gt": query_row["duration"],
         "timestamp_start_gt": query_row["timestamp_start"],
         "timestamp_end_gt": query_row["timestamp_end"],
         "query_text": query_row["sentences"],
         "strategy": strategy,
-        "top_k": top_k,
-        "num_results": 0,
-        "latency_total_ms": round(latency_ms, 2),
-        "latency_agentic_ms": 0.0,
-        "latency_heuristic_ms": 0.0,
-        "latency_rerank_ms": 0.0,
         "latency_server_total_ms": 0.0,
-        "error": error,
     }
 
     # Fill result columns with empty defaults
     for i in range(1, top_k + 1):
-        row[f"result_{i}_video_id"] = ""
-        row[f"result_{i}_frame_id"] = ""
-        row[f"result_{i}_score"] = ""
-        row[f"result_{i}_branch"] = ""
-        row[f"result_{i}_timestamp_start"] = ""
-        row[f"result_{i}_timestamp_end"] = ""
+        row[f"keyframe_{i}"] = ""
 
     if response is None:
         return row
 
     # Server-reported latency
     latency_data = response.get("latency_ms", {})
-    row["latency_agentic_ms"] = latency_data.get("agentic_ms", 0.0)
-    row["latency_heuristic_ms"] = latency_data.get("heuristic_ms", 0.0)
-    row["latency_rerank_ms"] = latency_data.get("rerank_ms", 0.0)
     row["latency_server_total_ms"] = latency_data.get("total_ms", 0.0)
 
     results = response.get("results", [])
-    row["num_results"] = len(results)
 
     for i, item in enumerate(results[:top_k], start=1):
-        row[f"result_{i}_video_id"] = item.get("video_id", "")
-        row[f"result_{i}_frame_id"] = item.get("frame_id", "")
-        row[f"result_{i}_score"] = item.get("score", "")
-        row[f"result_{i}_branch"] = item.get("branch", "")
-        row[f"result_{i}_timestamp_start"] = item.get("timestamp_start", "")
-        row[f"result_{i}_timestamp_end"] = item.get("timestamp_end", "")
+        vid = item.get("video_id", "")
+        fid = item.get("frame_id", "")
+        if vid and str(fid):
+            row[f"keyframe_{i}"] = f"{vid}_{fid}"
+
+    # For business metrics array we inject back error and num_results + total latency silently into row
+    row["_error"] = error
+    row["_num_results"] = len(results)
+    row["_latency_total_ms"] = round(latency_ms, 2)
 
     return row
 
@@ -318,21 +290,21 @@ def compute_business_metrics(
 
     # Latency distribution (client-side)
     latencies = [
-        float(r["latency_total_ms"])
+        float(r["_latency_total_ms"])
         for r in results
-        if r.get("error") == ""
+        if r.get("_error") == ""
     ]
 
     # Error analysis
-    errors = [r for r in results if r.get("error") != ""]
-    timeouts = [r for r in errors if "TIMEOUT" in str(r.get("error", ""))]
-    empty_results = [r for r in results if r.get("error") == "" and int(r.get("num_results", 0)) == 0]
+    errors = [r for r in results if r.get("_error") != ""]
+    timeouts = [r for r in errors if "TIMEOUT" in str(r.get("_error", ""))]
+    empty_results = [r for r in results if r.get("_error") == "" and int(r.get("_num_results", 0)) == 0]
 
     # Latency gap (client vs server)
     latency_gaps = []
     for r in results:
-        if r.get("error") == "" and float(r.get("latency_server_total_ms", 0)) > 0:
-            gap = float(r["latency_total_ms"]) - float(r["latency_server_total_ms"])
+        if r.get("_error") == "" and float(r.get("latency_server_total_ms", 0)) > 0:
+            gap = float(r["_latency_total_ms"]) - float(r["latency_server_total_ms"])
             latency_gaps.append(gap)
 
     cold_starts = [g for g in latency_gaps if g > float(statistics.mean(latency_gaps)) * 2] if latency_gaps else []
@@ -376,9 +348,9 @@ def save_summary_json(
 ) -> None:
     """Save summary JSON with business metrics."""
     total = len(results)
-    successful = sum(1 for r in results if r.get("error") == "")
+    successful = sum(1 for r in results if r.get("_error") == "")
     failed = total - successful
-    empty = sum(1 for r in results if r.get("error") == "" and int(r.get("num_results", 0)) == 0)
+    empty = sum(1 for r in results if r.get("_error") == "" and int(r.get("_num_results", 0)) == 0)
 
     summary = {
         "strategy": strategy,
@@ -468,11 +440,10 @@ def run_inference(
 
             # Build result row
             row = build_result_row(query_row, strategy, top_k, response, latency_ms, error)
-            results.append(row)
-
+            
             # Status indicator
             status = "✓" if error == "" else f"✗ {error[:40]}"
-            num_res = row["num_results"]
+            num_res = row["_num_results"]
             progress = _progress_bar(i + 1, len(pending))
             print(
                 f"\r  {progress}  idx={idx}  lat={latency_ms:.0f}ms  "
@@ -480,9 +451,17 @@ def run_inference(
                 end="", flush=True,
             )
 
+            # Keep only the CSV requested headers by stripping "_" prefixed private fields when adding to results
+            # We must keep them for JSON summary, so we save a copy of the dict with them
+            results.append(row)
+            
+            # Create a clean version just for CSV saving
+            clean_row = {k: v for k, v in row.items() if not k.startswith("_")}
+            
             # Periodic save (every 50 queries)
             if (i + 1) % 50 == 0:
-                save_csv(results, filepath, header)
+                clean_results = [{k: v for k, v in r.items() if not k.startswith("_")} for r in results]
+                save_csv(clean_results, filepath, header)
 
             # Delay between requests
             if i < len(pending) - 1:
@@ -492,7 +471,8 @@ def run_inference(
     total_runtime = time.perf_counter() - t_start_total
 
     # Final save
-    save_csv(results, filepath, header)
+    clean_results = [{k: v for k, v in r.items() if not k.startswith("_")} for r in results]
+    save_csv(clean_results, filepath, header)
     save_summary_json(
         strategy=strategy,
         batch=batch,
@@ -505,7 +485,7 @@ def run_inference(
     )
 
     # Print quick summary
-    successful = sum(1 for r in results if r.get("error") == "")
+    successful = sum(1 for r in results if r.get("_error") == "")
     failed = len(results) - successful
     metrics = compute_business_metrics(results, total_runtime)
 
@@ -577,6 +557,10 @@ def parse_args() -> argparse.Namespace:
         help=f"Output directory (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
+        "--limit", type=int, default=0,
+        help="Max number of queries to run. 0 = no limit (default: 0)",
+    )
+    parser.add_argument(
         "--resume", action="store_true",
         help="Resume from last completed query (skip already-done rows)",
     )
@@ -599,6 +583,11 @@ def main() -> None:
         queries = split_batch(all_queries, args.batch, args.total_batches)
     else:
         queries = all_queries
+
+    # Limit
+    if args.limit > 0:
+        queries = queries[:args.limit]
+        logger.info("Limited to %d queries (--limit %d)", len(queries), args.limit)
 
     # Determine strategies
     strategies = list(STRATEGY_ENDPOINTS.keys()) if args.strategy == "all" else [args.strategy]
