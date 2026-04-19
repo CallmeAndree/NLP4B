@@ -51,6 +51,7 @@ data/embeddings/
 data/faiss_indexes/
 data/cache/
 data/hf_home/
+
 # Shared-drive style artifact folders
 raw_videos/
 proxy_videos/
@@ -68,3 +69,4 @@ output/
 # Notebook outputs / misc
 *.out
 *.tmp
+
