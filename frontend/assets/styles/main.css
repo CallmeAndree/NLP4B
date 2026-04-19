@@ -20,19 +20,36 @@ body,
 }
 
 [data-testid="stHeader"] {
-    background: transparent !important;
-    box-shadow: none !important;
-}
-
-/* Ẩn cục Deploy/Menu bên phải nhưng giữ nút mở Sidebar bên trái */
-[data-testid="stHeaderActionElements"],
-.stAppDeployButton {
     display: none !important;
 }
 
-[data-testid="collapsedControl"] {
-    display: flex !important;
+[data-testid="stMainBlockContainer"] {
+    padding-top: 0 !important;
+}
+
+[data-testid="stVerticalBlock"] {
+    gap: 0 !important;
+}
+
+/* ── Brand logo ───────────────────────────────────────────────────────────── */
+.brand-logo {
+    position: absolute;
+    top: 24px;
+    left: 36px;
+    font-size: 22px;
+    font-weight: 800;
+    color: #1a1a2e !important;
+    text-decoration: none !important;
+    letter-spacing: -0.6px;
     z-index: 999999;
+    user-select: none;
+    cursor: pointer;
+    transition: color 0.15s ease, opacity 0.15s ease;
+}
+
+.brand-logo:hover {
+    color: #5a8dec !important;
+    opacity: 0.85;
 }
 
 [data-testid="stMainBlockContainer"] {
