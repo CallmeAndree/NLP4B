@@ -275,14 +275,44 @@ def load_resume_state(filepath: str) -> set:
     return done
 
 
-def load_existing_rows(filepath: str) -> List[Dict[str, Any]]:
+
+def _restore_private_fields(row: Dict[str, Any], top_k: int) -> Dict[str, Any]:
+    """Restore private runtime fields for rows reloaded from CSV in resume mode."""
+    restored = dict(row)
+
+    if "_error" not in restored:
+        restored["_error"] = ""
+
+    if "_num_results" not in restored:
+        num_results = 0
+        for i in range(1, top_k + 1):
+            if str(restored.get(f"keyframe_{i}", "")).strip():
+                num_results += 1
+        restored["_num_results"] = num_results
+
+    if "_latency_total_ms" not in restored:
+        try:
+            restored["_latency_total_ms"] = round(float(restored.get("latency_server_total_ms", 0) or 0), 2)
+        except Exception:
+            restored["_latency_total_ms"] = 0.0
+
+    if "_embed_ms" not in restored:
+        restored["_embed_ms"] = 0.0
+
+    if "_search_ms" not in restored:
+        restored["_search_ms"] = 0.0
+
+    return restored
+
+
+def load_existing_rows(filepath: str, top_k: int) -> List[Dict[str, Any]]:
     rows = []
     if not os.path.isfile(filepath):
         return rows
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                rows.append(row)
+                rows.append(_restore_private_fields(row, top_k))
     except Exception:
         pass
     return rows
@@ -392,7 +422,7 @@ def run_baseline(
     done_indices: set = set()
     if resume:
         done_indices = load_resume_state(filepath)
-        existing_rows = load_existing_rows(filepath)
+        existing_rows = load_existing_rows(filepath, top_k)
 
     results = list(existing_rows)
     pending = [q for q in queries if q["query_idx"] not in done_indices]
