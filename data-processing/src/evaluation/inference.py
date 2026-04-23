@@ -185,16 +185,12 @@ def build_result_row(
     latency_ms: float,
     error: str,
 ) -> Dict[str, Any]:
-<<<<<<< HEAD
     """Build a flat dict representing one CSV row.
 
     Private ``_``-prefixed fields are kept in-memory for summary metrics only.
     They are intentionally stripped before CSV write, so resume mode must never
     assume they already exist on rows loaded back from disk.
     """
-=======
-    """Build a flat dict representing one CSV row."""
->>>>>>> main
     row: Dict[str, Any] = {
         "query_idx": query_row["query_idx"],
         "video_id_gt": query_row["video_id"],
@@ -203,12 +199,9 @@ def build_result_row(
         "query_text": query_row["sentences"],
         "strategy": strategy,
         "latency_server_total_ms": 0.0,
-<<<<<<< HEAD
         "_error": error,
         "_num_results": 0,
         "_latency_total_ms": round(latency_ms, 2),
-=======
->>>>>>> main
     }
 
     # Fill result columns with empty defaults
@@ -230,15 +223,7 @@ def build_result_row(
         if vid and str(fid):
             row[f"keyframe_{i}"] = f"{vid}_{fid}"
 
-<<<<<<< HEAD
     row["_num_results"] = len(results)
-=======
-    # For business metrics array we inject back error and num_results + total latency silently into row
-    row["_error"] = error
-    row["_num_results"] = len(results)
-    row["_latency_total_ms"] = round(latency_ms, 2)
-
->>>>>>> main
     return row
 
 
@@ -282,7 +267,6 @@ def load_resume_state(filepath: str) -> set:
     return done
 
 
-<<<<<<< HEAD
 def _restore_private_fields(row: Dict[str, Any], top_k: int) -> Dict[str, Any]:
     """Rehydrate private in-memory fields for rows loaded back from CSV.
 
@@ -312,26 +296,13 @@ def load_existing_rows(filepath: str, header: List[str]) -> List[Dict[str, Any]]
 
     top_k = sum(1 for col in header if col.startswith("keyframe_"))
 
-=======
-def load_existing_rows(filepath: str, header: List[str]) -> List[Dict[str, Any]]:
-    """Load existing rows from CSV for resume mode."""
-    rows = []
-    if not os.path.isfile(filepath):
-        return rows
->>>>>>> main
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-<<<<<<< HEAD
                 rows.append(_restore_private_fields(row, top_k))
     except Exception as exc:
         logger.warning("Could not load existing rows from %s: %s", filepath, exc)
-=======
-                rows.append(row)
-    except Exception:
-        pass
->>>>>>> main
     return rows
 
 
@@ -500,11 +471,7 @@ def run_inference(
             
             # Status indicator
             status = "✓" if error == "" else f"✗ {error[:40]}"
-<<<<<<< HEAD
             num_res = int(row.get("_num_results", 0) or 0)
-=======
-            num_res = row["_num_results"]
->>>>>>> main
             progress = _progress_bar(i + 1, len(pending))
             print(
                 f"\r  {progress}  idx={idx}  lat={latency_ms:.0f}ms  "
