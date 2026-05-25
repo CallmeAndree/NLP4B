@@ -30,12 +30,11 @@ An **end-to-end multimodal video retrieval pipeline** that turns natural-languag
 
 ## 📸 Demo
 
-<!-- Replace with actual screenshots or GIF -->
 <div align="center">
 
 | Query Input | Retrieved Keyframes |
 |:-----------:|:-------------------:|
-| ![Query Screenshot](https://via.placeholder.com/400x250?text=Query+Input) | ![Results Screenshot](https://via.placeholder.com/400x250?text=Retrieved+Keyframes) |
+| ![Query Input](docs/images/lookup_query.png) | ![Retrieved Keyframes](docs/images/lookup_results.png) |
 
 </div>
 
